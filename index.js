@@ -33,7 +33,6 @@ const server = http.createServer(async (req, res) => {
     }
 
     const { s3_key, timestamps, speaker_label } = body;
-
     if (!s3_key || !timestamps || timestamps.length === 0) {
       res.writeHead(400);
       return res.end(JSON.stringify({ error: "s3_key and timestamps required" }));
@@ -64,6 +63,7 @@ const server = http.createServer(async (req, res) => {
 
       const listFile = `${tmpDir}/list.txt`;
       fs.writeFileSync(listFile, segFiles.map(f => `file '${f}'`).join("\n"));
+
       const outputFile = `${tmpDir}/output.wav`;
       execSync(
         `ffmpeg -f concat -safe 0 -i "${listFile}" -acodec pcm_s16le -ar 44100 -ac 1 "${outputFile}" -y 2>/dev/null`,
@@ -95,6 +95,7 @@ const server = http.createServer(async (req, res) => {
         size_mb: parseFloat(sizeMB),
         segment_count: segFiles.length,
       }));
+
     } catch (err) {
       console.error("Extraction error:", err.message);
       res.writeHead(500);
@@ -131,16 +132,19 @@ const server = http.createServer(async (req, res) => {
     try {
       console.log(`Time-stretching audio to ${target_duration_sec}s`);
 
-      // Download the source audio
-      execSync(`curl -sL -o "${inputFile}" "${audio_url}"`, { timeout: 30000 });
+      // Download the source audio using fetch (works in Node 18+)
+      const downloadRes = await fetch(audio_url);
+      if (!downloadRes.ok) throw new Error(`Download failed: ${downloadRes.status}`);
+      const audioArrayBuffer = await downloadRes.arrayBuffer();
+      fs.writeFileSync(inputFile, Buffer.from(audioArrayBuffer));
 
       // Get original duration using ffprobe
       const probeResult = execSync(
         `ffprobe -v quiet -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${inputFile}"`,
         { timeout: 10000 }
       ).toString().trim();
-      const originalDuration = parseFloat(probeResult);
 
+      const originalDuration = parseFloat(probeResult);
       if (!originalDuration || originalDuration <= 0) {
         throw new Error("Could not determine audio duration");
       }
@@ -180,6 +184,7 @@ const server = http.createServer(async (req, res) => {
 
       res.writeHead(200, { "Content-Type": "audio/mpeg" });
       res.end(stretchedBuffer);
+
     } catch (err) {
       console.error("Time-stretch error:", err.message);
       fs.rmSync(tmpDir, { recursive: true, force: true });
