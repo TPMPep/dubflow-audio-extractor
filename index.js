@@ -191,6 +191,61 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(500);
       res.end(JSON.stringify({ error: err.message }));
     }
+return;
+  }
+
+  // ── NEW: Process audio with custom FFmpeg filters (pitch shift, EQ, etc.) ──
+  if (req.method === "POST" && req.url === "/process") {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString());
+
+    // Auth via Bearer token or api_key field
+    const authHeader = req.headers["authorization"] || "";
+    const token = authHeader.replace("Bearer ", "");
+    if (token !== API_KEY && body.api_key !== API_KEY) {
+      res.writeHead(401);
+      return res.end(JSON.stringify({ error: "Unauthorized" }));
+    }
+
+    const { source_url, filters, output_format = "mp3" } = body;
+    if (!source_url || !filters) {
+      res.writeHead(400);
+      return res.end(JSON.stringify({ error: "source_url and filters required" }));
+    }
+
+    const tmpDir = `/tmp/process_${Date.now()}`;
+    fs.mkdirSync(tmpDir, { recursive: true });
+    const inputFile = `${tmpDir}/input.mp3`;
+    const outputFile = `${tmpDir}/output.${output_format}`;
+
+    try {
+      console.log(`[process] Applying filters: ${filters}`);
+
+      // Download source audio
+      const downloadRes = await fetch(source_url);
+      if (!downloadRes.ok) throw new Error(`Download failed: ${downloadRes.status}`);
+      const audioArrayBuffer = await downloadRes.arrayBuffer();
+      fs.writeFileSync(inputFile, Buffer.from(audioArrayBuffer));
+
+      // Run FFmpeg with the filter chain
+      const cmd = `ffmpeg -y -i "${inputFile}" -af "${filters}" -c:a libmp3lame -q:a 2 "${outputFile}" 2>/dev/null`;
+      console.log(`[process] Running: ${cmd}`);
+      execSync(cmd, { timeout: 30000 });
+
+      // Read and return
+      const outputBuffer = fs.readFileSync(outputFile);
+      console.log(`[process] Output: ${(outputBuffer.length / 1024).toFixed(0)}KB`);
+
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      res.writeHead(200, { "Content-Type": `audio/${output_format}` });
+      res.end(outputBuffer);
+    } catch (err) {
+      console.error("[process] Error:", err.message);
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: err.message }));
+    }
     return;
   }
 
