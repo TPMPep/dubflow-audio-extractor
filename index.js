@@ -21,7 +21,7 @@ const server = http.createServer(async (req, res) => {
     return res.end("ok");
   }
 
-  // ── EXISTING: Extract speaker audio segments ──
+  // ── Extract speaker audio segments ──
   if (req.method === "POST" && req.url === "/extract") {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
@@ -104,13 +104,12 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ── NEW: Time-stretch audio to fit a target duration ──
+  // ── Time-stretch audio to fit a target duration ──
   if (req.method === "POST" && req.url === "/time-stretch") {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString());
 
-    // Auth via Bearer token or api_key field
     const authHeader = req.headers["authorization"] || "";
     const token = authHeader.replace("Bearer ", "");
     if (token !== API_KEY && body.api_key !== API_KEY) {
@@ -132,13 +131,11 @@ const server = http.createServer(async (req, res) => {
     try {
       console.log(`Time-stretching audio to ${target_duration_sec}s`);
 
-      // Download the source audio using fetch (works in Node 18+)
       const downloadRes = await fetch(audio_url);
       if (!downloadRes.ok) throw new Error(`Download failed: ${downloadRes.status}`);
       const audioArrayBuffer = await downloadRes.arrayBuffer();
       fs.writeFileSync(inputFile, Buffer.from(audioArrayBuffer));
 
-      // Get original duration using ffprobe
       const probeResult = execSync(
         `ffprobe -v quiet -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${inputFile}"`,
         { timeout: 10000 }
@@ -149,11 +146,9 @@ const server = http.createServer(async (req, res) => {
         throw new Error("Could not determine audio duration");
       }
 
-      // Calculate tempo ratio
       const ratio = originalDuration / target_duration_sec;
       console.log(`Original: ${originalDuration.toFixed(2)}s, Target: ${target_duration_sec}s, Ratio: ${ratio.toFixed(3)}`);
 
-      // Build atempo filter chain (each filter must be between 0.5 and 2.0)
       const filters = [];
       let remaining = ratio;
       while (remaining > 2.0) {
@@ -169,17 +164,14 @@ const server = http.createServer(async (req, res) => {
 
       console.log(`FFmpeg filter: ${filterStr}`);
 
-      // Run FFmpeg time-stretch (preserves pitch)
       execSync(
         `ffmpeg -y -i "${inputFile}" -filter:a "${filterStr}" -vn "${outputFile}" 2>/dev/null`,
         { timeout: 30000 }
       );
 
-      // Read the result and send it back
       const stretchedBuffer = fs.readFileSync(outputFile);
       console.log(`Stretched audio: ${(stretchedBuffer.length / 1024).toFixed(0)}KB`);
 
-      // Cleanup
       fs.rmSync(tmpDir, { recursive: true, force: true });
 
       res.writeHead(200, { "Content-Type": "audio/mpeg" });
@@ -191,16 +183,15 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(500);
       res.end(JSON.stringify({ error: err.message }));
     }
-return;
+    return;
   }
 
-  // ── NEW: Process audio with custom FFmpeg filters (pitch shift, EQ, etc.) ──
+  // ── Process audio with custom FFmpeg filters (supports extra_args for seeking) ──
   if (req.method === "POST" && req.url === "/process") {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString());
 
-    // Auth via Bearer token or api_key field
     const authHeader = req.headers["authorization"] || "";
     const token = authHeader.replace("Bearer ", "");
     if (token !== API_KEY && body.api_key !== API_KEY) {
@@ -208,7 +199,7 @@ return;
       return res.end(JSON.stringify({ error: "Unauthorized" }));
     }
 
-    const { source_url, filters, output_format = "mp3" } = body;
+    const { source_url, filters, output_format = "mp3", extra_args = "" } = body;
     if (!source_url || !filters) {
       res.writeHead(400);
       return res.end(JSON.stringify({ error: "source_url and filters required" }));
@@ -216,24 +207,56 @@ return;
 
     const tmpDir = `/tmp/process_${Date.now()}`;
     fs.mkdirSync(tmpDir, { recursive: true });
-    const inputFile = `${tmpDir}/input.mp3`;
+    const inputFile = `${tmpDir}/input`;
     const outputFile = `${tmpDir}/output.${output_format}`;
 
     try {
-      console.log(`[process] Applying filters: ${filters}`);
+      console.log(`[process] Applying filters: ${filters}, extra_args: ${extra_args || "(none)"}`);
 
-      // Download source audio
+      // Download source
       const downloadRes = await fetch(source_url);
       if (!downloadRes.ok) throw new Error(`Download failed: ${downloadRes.status}`);
       const audioArrayBuffer = await downloadRes.arrayBuffer();
       fs.writeFileSync(inputFile, Buffer.from(audioArrayBuffer));
+      console.log(`[process] Downloaded ${(audioArrayBuffer.byteLength / 1024 / 1024).toFixed(1)} MB`);
 
-      // Run FFmpeg with the filter chain
-      const cmd = `ffmpeg -y -i "${inputFile}" -af "${filters}" -c:a libmp3lame -q:a 2 "${outputFile}" 2>/dev/null`;
+      // Parse extra_args to separate input flags (-ss, -t, -vn, -ac, -b:a, etc.)
+      // -ss and -t go BEFORE -i for fast seeking; the rest go after
+      const inputFlags = [];  // before -i (seeking)
+      const outputFlags = []; // after -i (codec/format)
+      if (extra_args) {
+        const parts = extra_args.trim().split(/\s+/);
+        let i = 0;
+        while (i < parts.length) {
+          const flag = parts[i];
+          if (flag === "-ss" || flag === "-t") {
+            // These are input flags — put before -i for fast seeking
+            inputFlags.push(flag, parts[i + 1] || "");
+            i += 2;
+          } else if (flag === "-vn") {
+            // No video — output flag
+            outputFlags.push(flag);
+            i += 1;
+          } else if (flag === "-ac" || flag === "-b:a" || flag === "-ar" || flag === "-acodec") {
+            // Codec/format flags with a value — output flags
+            outputFlags.push(flag, parts[i + 1] || "");
+            i += 2;
+          } else {
+            // Unknown flag — treat as output flag
+            outputFlags.push(flag);
+            i += 1;
+          }
+        }
+      }
+
+      const inputFlagsStr = inputFlags.length > 0 ? inputFlags.join(" ") + " " : "";
+      const outputFlagsStr = outputFlags.length > 0 ? " " + outputFlags.join(" ") : "";
+
+      // Build FFmpeg command
+      const cmd = `ffmpeg -y ${inputFlagsStr}-i "${inputFile}" -af "${filters}"${outputFlagsStr} -c:a libmp3lame -q:a 2 "${outputFile}" 2>/dev/null`;
       console.log(`[process] Running: ${cmd}`);
-      execSync(cmd, { timeout: 30000 });
+      execSync(cmd, { timeout: 120000 });
 
-      // Read and return
       const outputBuffer = fs.readFileSync(outputFile);
       console.log(`[process] Output: ${(outputBuffer.length / 1024).toFixed(0)}KB`);
 
@@ -242,6 +265,66 @@ return;
       res.end(outputBuffer);
     } catch (err) {
       console.error("[process] Error:", err.message);
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // ── Concatenate multiple audio files ──
+  if (req.method === "POST" && req.url === "/concat") {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString());
+
+    const authHeader = req.headers["authorization"] || "";
+    const token = authHeader.replace("Bearer ", "");
+    if (token !== API_KEY && body.api_key !== API_KEY) {
+      res.writeHead(401);
+      return res.end(JSON.stringify({ error: "Unauthorized" }));
+    }
+
+    const { audio_urls, output_format = "mp3" } = body;
+    if (!audio_urls || !Array.isArray(audio_urls) || audio_urls.length === 0) {
+      res.writeHead(400);
+      return res.end(JSON.stringify({ error: "audio_urls array required" }));
+    }
+
+    const tmpDir = `/tmp/concat_${Date.now()}`;
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    try {
+      console.log(`[concat] Concatenating ${audio_urls.length} files`);
+
+      const inputFiles = [];
+      for (let i = 0; i < audio_urls.length; i++) {
+        const dlRes = await fetch(audio_urls[i]);
+        if (!dlRes.ok) throw new Error(`Download failed for file ${i}: ${dlRes.status}`);
+        const buf = Buffer.from(await dlRes.arrayBuffer());
+        const filePath = `${tmpDir}/part_${i}.mp3`;
+        fs.writeFileSync(filePath, buf);
+        inputFiles.push(filePath);
+        console.log(`[concat] Downloaded part ${i}: ${(buf.length / 1024).toFixed(0)}KB`);
+      }
+
+      const listFile = `${tmpDir}/list.txt`;
+      fs.writeFileSync(listFile, inputFiles.map(f => `file '${f}'`).join("\n"));
+
+      const outputFile = `${tmpDir}/output.${output_format}`;
+      execSync(
+        `ffmpeg -f concat -safe 0 -i "${listFile}" -c:a libmp3lame -q:a 2 "${outputFile}" -y 2>/dev/null`,
+        { timeout: 120000 }
+      );
+
+      const outputBuffer = fs.readFileSync(outputFile);
+      console.log(`[concat] Output: ${(outputBuffer.length / 1024).toFixed(0)}KB`);
+
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      res.writeHead(200, { "Content-Type": `audio/${output_format}` });
+      res.end(outputBuffer);
+    } catch (err) {
+      console.error("[concat] Error:", err.message);
       fs.rmSync(tmpDir, { recursive: true, force: true });
       res.writeHead(500);
       res.end(JSON.stringify({ error: err.message }));
