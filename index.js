@@ -271,7 +271,98 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
+// ── Normalize a voice sample for ElevenLabs cloning ──
+  // Downloads source from a signed URL, runs denoise + loudness normalization,
+  // uploads the result as 44.1kHz mono 16-bit WAV back to S3.
+  if (req.method === "POST" && req.url === "/normalize-voice-sample") {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString());
 
+    const authHeader = req.headers["authorization"] || "";
+    const token = authHeader.replace("Bearer ", "");
+    if (token !== API_KEY && body.api_key !== API_KEY) {
+      res.writeHead(401);
+      return res.end(JSON.stringify({ error: "Unauthorized" }));
+    }
+
+    const {
+      source_signed_url,
+      target_bucket,
+      target_key,
+      aws_region,
+      aws_access_key_id,
+      aws_secret_access_key,
+      ffmpeg_filter = "afftdn=nr=12,highpass=f=80,loudnorm=I=-16:TP=-1.5:LRA=11",
+    } = body;
+
+    if (!source_signed_url || !target_bucket || !target_key) {
+      res.writeHead(400);
+      return res.end(JSON.stringify({ error: "source_signed_url, target_bucket, target_key required" }));
+    }
+
+    const tmpDir = `/tmp/normalize_${Date.now()}`;
+    fs.mkdirSync(tmpDir, { recursive: true });
+    const inputFile = `${tmpDir}/input`;
+    const outputFile = `${tmpDir}/output.wav`;
+
+    try {
+      console.log(`[normalize] Fetching source for normalization`);
+      const downloadRes = await fetch(source_signed_url);
+      if (!downloadRes.ok) throw new Error(`Download failed: ${downloadRes.status}`);
+      const audioArrayBuffer = await downloadRes.arrayBuffer();
+      fs.writeFileSync(inputFile, Buffer.from(audioArrayBuffer));
+      console.log(`[normalize] Downloaded ${(audioArrayBuffer.byteLength / 1024 / 1024).toFixed(2)} MB`);
+
+      // Denoise + loudnorm → mono 44.1kHz 16-bit PCM WAV (ideal for ElevenLabs cloning)
+      execSync(
+        `ffmpeg -y -i "${inputFile}" -af "${ffmpeg_filter}" -ac 1 -ar 44100 -sample_fmt s16 -c:a pcm_s16le "${outputFile}" 2>/dev/null`,
+        { timeout: 120000 }
+      );
+
+      // Probe duration
+      const probeResult = execSync(
+        `ffprobe -v quiet -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${outputFile}"`,
+        { timeout: 10000 }
+      ).toString().trim();
+      const durationSec = parseFloat(probeResult) || 0;
+
+      const outputBuffer = fs.readFileSync(outputFile);
+      console.log(`[normalize] Output: ${(outputBuffer.length / 1024).toFixed(0)}KB, ${durationSec.toFixed(2)}s`);
+
+      // Upload to the caller's bucket using THEIR credentials (so writes stay
+      // within Base44's AWS account, not this service's).
+      const callerS3 = new S3Client({
+        region: aws_region || process.env.AWS_REGION || "us-west-2",
+        credentials: {
+          accessKeyId: aws_access_key_id,
+          secretAccessKey: aws_secret_access_key,
+        },
+      });
+
+      await callerS3.send(new PutObjectCommand({
+        Bucket: target_bucket,
+        Key: target_key,
+        Body: outputBuffer,
+        ContentType: "audio/wav",
+      }));
+
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        ok: true,
+        duration_ms: Math.round(durationSec * 1000),
+        size_bytes: outputBuffer.length,
+      }));
+    } catch (err) {
+      console.error("[normalize] Error:", err.message);
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
   // ── Concatenate multiple audio files ──
   if (req.method === "POST" && req.url === "/concat") {
     const chunks = [];
