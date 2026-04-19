@@ -271,7 +271,202 @@ const server = http.createServer(async (req, res) => {
     }
     return;
   }
-// ── Normalize a voice sample for ElevenLabs cloning ──
+ // ── Trim audio to a precise window with optional fades ──
+  // POST /trim { audio_url, start_ms, end_ms, fade_in_ms?, fade_out_ms?, output_format? }
+  // Returns the trimmed audio file binary directly (Content-Type: audio/<format>).
+  // Used by pickup-line recording flow to remove dead air based on AssemblyAI word timings
+  // OR based on user-dragged trim handles in the preview sandbox.
+  if (req.method === "POST" && req.url === "/trim") {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString());
+
+    const authHeader = req.headers["authorization"] || "";
+    const token = authHeader.replace("Bearer ", "");
+    if (token !== API_KEY && body.api_key !== API_KEY) {
+      res.writeHead(401);
+      return res.end(JSON.stringify({ error: "Unauthorized" }));
+    }
+
+    const {
+      audio_url,
+      start_ms,
+      end_ms,
+      fade_in_ms = 30,
+      fade_out_ms = 50,
+      output_format = "mp3",
+    } = body;
+
+    if (!audio_url || start_ms == null || end_ms == null) {
+      res.writeHead(400);
+      return res.end(JSON.stringify({ error: "audio_url, start_ms, end_ms required" }));
+    }
+    if (end_ms <= start_ms) {
+      res.writeHead(400);
+      return res.end(JSON.stringify({ error: "end_ms must be greater than start_ms" }));
+    }
+
+    const tmpDir = `/tmp/trim_${Date.now()}`;
+    fs.mkdirSync(tmpDir, { recursive: true });
+    const inputFile = `${tmpDir}/input`;
+    const outputFile = `${tmpDir}/output.${output_format}`;
+
+    try {
+      const startSec = (start_ms / 1000).toFixed(3);
+      const durationMs = end_ms - start_ms;
+      const durationSec = (durationMs / 1000).toFixed(3);
+      const fadeInSec = (fade_in_ms / 1000).toFixed(3);
+      const fadeOutSec = (fade_out_ms / 1000).toFixed(3);
+      const fadeOutStartSec = ((durationMs - fade_out_ms) / 1000).toFixed(3);
+
+      console.log(`[trim] start=${startSec}s dur=${durationSec}s fadeIn=${fadeInSec}s fadeOut=${fadeOutSec}s`);
+
+      const downloadRes = await fetch(audio_url);
+      if (!downloadRes.ok) throw new Error(`Download failed: ${downloadRes.status}`);
+      const audioArrayBuffer = await downloadRes.arrayBuffer();
+      fs.writeFileSync(inputFile, Buffer.from(audioArrayBuffer));
+
+      // Only apply fades if window is long enough to fit them comfortably
+      const totalSec = parseFloat(durationSec);
+      const filters = [];
+      if (fade_in_ms > 0 && totalSec > parseFloat(fadeInSec) * 2) {
+        filters.push(`afade=t=in:st=0:d=${fadeInSec}`);
+      }
+      if (fade_out_ms > 0 && totalSec > parseFloat(fadeOutSec) * 2) {
+        filters.push(`afade=t=out:st=${fadeOutStartSec}:d=${fadeOutSec}`);
+      }
+      const filterArg = filters.length > 0 ? `-af "${filters.join(",")}"` : "";
+
+      const cmd = `ffmpeg -y -ss ${startSec} -t ${durationSec} -i "${inputFile}" ${filterArg} -c:a libmp3lame -q:a 2 -ac 1 -ar 44100 "${outputFile}" 2>/dev/null`;
+      console.log(`[trim] Running: ${cmd}`);
+      execSync(cmd, { timeout: 30000 });
+
+      const outputBuffer = fs.readFileSync(outputFile);
+      console.log(`[trim] Output: ${(outputBuffer.length / 1024).toFixed(0)}KB, dur=${durationSec}s`);
+
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      res.writeHead(200, { "Content-Type": `audio/${output_format}` });
+      res.end(outputBuffer);
+    } catch (err) {
+      console.error("[trim] Error:", err.message);
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // ── Auto-detect dead air (silence) at the head and tail of an audio clip ──
+  // POST /silence-detect { audio_url, silence_threshold_db?, min_silence_duration_sec? }
+  // Returns: { duration_sec, leading_silence_sec, trailing_silence_sec,
+  //            speech_start_sec, speech_end_sec, silences: [...] }
+  // Used by the pickup-line preview sandbox to suggest a smart auto-trim window
+  // when AssemblyAI word timings aren't precise enough (or as a sanity check on them).
+  if (req.method === "POST" && req.url === "/silence-detect") {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString());
+
+    const authHeader = req.headers["authorization"] || "";
+    const token = authHeader.replace("Bearer ", "");
+    if (token !== API_KEY && body.api_key !== API_KEY) {
+      res.writeHead(401);
+      return res.end(JSON.stringify({ error: "Unauthorized" }));
+    }
+
+    const {
+      audio_url,
+      silence_threshold_db = -35,    // anything quieter than -35dBFS is "silence"
+      min_silence_duration_sec = 0.3, // ignore silences shorter than 300ms
+    } = body;
+
+    if (!audio_url) {
+      res.writeHead(400);
+      return res.end(JSON.stringify({ error: "audio_url required" }));
+    }
+
+    const tmpDir = `/tmp/silence_${Date.now()}`;
+    fs.mkdirSync(tmpDir, { recursive: true });
+    const inputFile = `${tmpDir}/input`;
+
+    try {
+      console.log(`[silence-detect] threshold=${silence_threshold_db}dB min=${min_silence_duration_sec}s`);
+
+      const downloadRes = await fetch(audio_url);
+      if (!downloadRes.ok) throw new Error(`Download failed: ${downloadRes.status}`);
+      const audioArrayBuffer = await downloadRes.arrayBuffer();
+      fs.writeFileSync(inputFile, Buffer.from(audioArrayBuffer));
+
+      // Get total duration
+      const probeOut = execSync(
+        `ffprobe -v quiet -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${inputFile}"`,
+        { timeout: 10000 }
+      ).toString().trim();
+      const durationSec = parseFloat(probeOut);
+      if (!durationSec || durationSec <= 0) throw new Error("Could not determine audio duration");
+
+      // Run silencedetect — output goes to stderr, not stdout
+      let stderr = "";
+      try {
+        execSync(
+          `ffmpeg -i "${inputFile}" -af "silencedetect=noise=${silence_threshold_db}dB:d=${min_silence_duration_sec}" -f null - 2>&1`,
+          { timeout: 30000, encoding: "utf8" }
+        );
+      } catch (e) {
+        // ffmpeg writes to stderr; execSync throws when stdout is empty even on success
+        stderr = (e.stdout || "") + (e.stderr || "") + (e.message || "");
+      }
+
+      // Parse silence_start / silence_end pairs
+      const silenceStartRegex = /silence_start:\s*([\d.]+)/g;
+      const silenceEndRegex = /silence_end:\s*([\d.]+)/g;
+      const silences = [];
+      const starts = [];
+      const ends = [];
+      let m;
+      while ((m = silenceStartRegex.exec(stderr)) !== null) starts.push(parseFloat(m[1]));
+      while ((m = silenceEndRegex.exec(stderr)) !== null) ends.push(parseFloat(m[1]));
+      for (let i = 0; i < starts.length; i++) {
+        const s = starts[i];
+        const e = ends[i] != null ? ends[i] : durationSec; // trailing silence has no end
+        silences.push({ start_sec: +s.toFixed(3), end_sec: +e.toFixed(3), duration_sec: +(e - s).toFixed(3) });
+      }
+
+      // Leading silence: from 0 to start of first non-silence
+      const leadingSilence = (silences.length > 0 && silences[0].start_sec < 0.05)
+        ? silences[0].duration_sec
+        : 0;
+
+      // Trailing silence: from end of last non-silence to duration
+      const lastSilence = silences[silences.length - 1];
+      const trailingSilence = (lastSilence && Math.abs(lastSilence.end_sec - durationSec) < 0.05)
+        ? lastSilence.duration_sec
+        : 0;
+
+      const speechStart = leadingSilence;
+      const speechEnd = durationSec - trailingSilence;
+
+      console.log(`[silence-detect] dur=${durationSec.toFixed(2)}s speech=${speechStart.toFixed(2)}s-${speechEnd.toFixed(2)}s silences=${silences.length}`);
+
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        duration_sec: +durationSec.toFixed(3),
+        leading_silence_sec: +leadingSilence.toFixed(3),
+        trailing_silence_sec: +trailingSilence.toFixed(3),
+        speech_start_sec: +speechStart.toFixed(3),
+        speech_end_sec: +speechEnd.toFixed(3),
+        silences,
+      }));
+    } catch (err) {
+      console.error("[silence-detect] Error:", err.message);
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+  // ── Normalize a voice sample for ElevenLabs cloning ──
   // Downloads source from a signed URL, runs denoise + loudness normalization,
   // uploads the result as 44.1kHz mono 16-bit WAV back to S3.
   if (req.method === "POST" && req.url === "/normalize-voice-sample") {
