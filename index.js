@@ -3,6 +3,7 @@ const { execSync } = require("child_process");
 const fs = require("fs");
 const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+const { registerMixFinal } = require("./mixFinal");
 
 const s3 = new S3Client({
   region: process.env.AWS_REGION || "us-west-2",
@@ -622,4 +623,5 @@ const server = http.createServer(async (req, res) => {
   res.end("Not found");
 });
 
+registerMixFinal(server, API_KEY);
 server.listen(3000, () => console.log("Audio extractor running on port 3000"));
