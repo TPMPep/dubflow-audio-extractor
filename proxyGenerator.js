@@ -1,131 +1,143 @@
-// proxyGenerator.js — Background proxy generation worker for Railway.
+// proxyGenerator.js — Background proxy generation for the editor.
 //
-// Receives a generate-proxy job, immediately returns 202, then runs ffmpeg
-// in the background. On completion (or failure) PATCHes the Project entity
-// in Base44 directly via the Base44 REST API.
-//
-// Two outputs per source file:
-//   - Video proxy: 720p H.264, 2 Mbps  (~900 MB/hr)
-//   - Audio proxy: 16 kHz mono FLAC    (~60 MB/hr — used by AssemblyAI/Replicate)
+// Pattern matches mixFinal.js: exports a `registerProxyGen(server, API_KEY)`
+// that mounts a POST /generate-proxy route on the existing http server.
+// Returns 202 immediately, runs ffmpeg in the background, then PATCHes the
+// Project entity in Base44 when done (or on failure).
 
-const { spawn } = require('child_process');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
-const axios = require('axios');
+const { execSync } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+const axios = require("axios");
+const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 
-const BASE44_API_URL = process.env.BASE44_API_URL || 'https://app.base44.com/api';
+const BASE44_API_URL = process.env.BASE44_API_URL || "https://app.base44.com/api";
 const BASE44_APP_ID = process.env.BASE44_APP_ID;
-const BASE44_SERVICE_TOKEN = process.env.BASE44_SERVICE_TOKEN; // service role token
+const BASE44_SERVICE_TOKEN = process.env.BASE44_SERVICE_TOKEN;
 
 function s3ClientForRegion(region, prefix) {
-  // Allow per-profile credential prefixes (matches Base44 _resolveCredentials).
   const accessKeyId = (prefix && process.env[`${prefix}_ACCESS_KEY_ID`]) || process.env.AWS_ACCESS_KEY_ID;
   const secretAccessKey = (prefix && process.env[`${prefix}_SECRET_ACCESS_KEY`]) || process.env.AWS_SECRET_ACCESS_KEY;
   return new S3Client({ region, credentials: { accessKeyId, secretAccessKey } });
 }
 
-function runFfmpeg(args) {
-  return new Promise((resolve, reject) => {
-    const proc = spawn('ffmpeg', args);
-    let stderr = '';
-    proc.stderr.on('data', (d) => { stderr += d.toString(); });
-    proc.on('close', (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`ffmpeg exit ${code}: ${stderr.slice(-2000)}`));
-    });
-    proc.on('error', reject);
-  });
-}
-
 async function patchProject(projectId, patch) {
+  if (!BASE44_APP_ID || !BASE44_SERVICE_TOKEN) {
+    console.error("[generate-proxy] Missing BASE44_APP_ID or BASE44_SERVICE_TOKEN env var");
+    return;
+  }
   await axios.patch(
     `${BASE44_API_URL}/apps/${BASE44_APP_ID}/entities/Project/${projectId}`,
     patch,
-    { headers: { 'api_key': BASE44_SERVICE_TOKEN, 'Content-Type': 'application/json' } }
+    { headers: { "api_key": BASE44_SERVICE_TOKEN, "Content-Type": "application/json" } }
   );
 }
 
-async function uploadToS3(s3, bucket, key, filePath, contentType) {
-  const stream = fs.createReadStream(filePath);
-  await s3.send(new PutObjectCommand({
-    Bucket: bucket, Key: key, Body: stream, ContentType: contentType,
-  }));
-}
-
-async function generateProxyJob({
+async function runProxyJob({
   project_id, source_url, bucket, region,
   proxy_video_key, proxy_audio_key, credential_secret_prefix,
 }) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `proxy-${project_id}-`));
-  const videoPath = path.join(tmpDir, 'proxy.mp4');
-  const audioPath = path.join(tmpDir, 'proxy.flac');
+  const videoPath = path.join(tmpDir, "proxy.mp4");
+  const audioPath = path.join(tmpDir, "proxy.flac");
 
   try {
-    // Run ffmpeg ONCE producing both outputs in parallel — single decode of source.
-    await runFfmpeg([
-      '-hide_banner', '-loglevel', 'error',
-      '-i', source_url,
-      // Video proxy: 720p H.264, ~2 Mbps, fast preset, AAC 128k stereo audio
-      '-map', '0:v:0?', '-map', '0:a:0?',
-      '-c:v', 'libx264', '-preset', 'fast', '-b:v', '2M', '-maxrate', '2.5M', '-bufsize', '4M',
-      '-vf', 'scale=-2:720',
-      '-c:a', 'aac', '-b:a', '128k', '-ac', '2',
-      '-movflags', '+faststart',
-      '-f', 'mp4', videoPath,
+    console.log(`[generate-proxy] ${project_id} starting`);
+
+    // Single ffmpeg pass producing both proxies — only decodes source once.
+    const cmd =
+      `ffmpeg -hide_banner -loglevel error -i "${source_url}" ` +
+      // Video proxy: 720p H.264 ~2 Mbps, AAC 128k stereo
+      `-map "0:v:0?" -map "0:a:0?" ` +
+      `-c:v libx264 -preset fast -b:v 2M -maxrate 2.5M -bufsize 4M ` +
+      `-vf "scale=-2:720" ` +
+      `-c:a aac -b:a 128k -ac 2 -movflags +faststart ` +
+      `-f mp4 "${videoPath}" ` +
       // Audio proxy: 16 kHz mono FLAC for AssemblyAI / Replicate
-      '-map', '0:a:0?',
-      '-vn', '-ac', '1', '-ar', '16000',
-      '-c:a', 'flac',
-      '-f', 'flac', audioPath,
-    ]);
+      `-map "0:a:0?" -vn -ac 1 -ar 16000 -c:a flac -f flac "${audioPath}"`;
+
+    execSync(cmd, { timeout: 4 * 60 * 60 * 1000, stdio: "inherit" }); // 4hr ceiling
 
     const s3 = s3ClientForRegion(region, credential_secret_prefix);
+    const videoBuffer = fs.readFileSync(videoPath);
+    const audioBuffer = fs.readFileSync(audioPath);
+
     await Promise.all([
-      uploadToS3(s3, bucket, proxy_video_key, videoPath, 'video/mp4'),
-      uploadToS3(s3, bucket, proxy_audio_key, audioPath, 'audio/flac'),
+      s3.send(new PutObjectCommand({
+        Bucket: bucket, Key: proxy_video_key, Body: videoBuffer, ContentType: "video/mp4",
+      })),
+      s3.send(new PutObjectCommand({
+        Bucket: bucket, Key: proxy_audio_key, Body: audioBuffer, ContentType: "audio/flac",
+      })),
     ]);
 
-    // We don't sign here — Base44's signProjectAssets / editor will sign on demand.
-    // Just store the S3 keys and a public URL pattern; the SDK refreshes signed URLs.
     const proxyMediaUrl = `https://${bucket}.s3.${region}.amazonaws.com/${proxy_video_key}`;
-
     await patchProject(project_id, {
-      proxy_status: 'ready',
+      proxy_status: "ready",
       proxy_media_key: proxy_video_key,
       proxy_audio_key: proxy_audio_key,
       proxy_media_url: proxyMediaUrl,
       proxy_generated_at: new Date().toISOString(),
       proxy_error: null,
     });
-    console.log(`[generateProxy] ${project_id} ready`);
+    console.log(`[generate-proxy] ${project_id} ready (video ${(videoBuffer.length / 1024 / 1024).toFixed(0)}MB, audio ${(audioBuffer.length / 1024 / 1024).toFixed(0)}MB)`);
   } catch (err) {
-    console.error(`[generateProxy] ${project_id} failed:`, err.message);
-    await patchProject(project_id, {
-      proxy_status: 'failed',
-      proxy_error: String(err.message || err).slice(0, 500),
-    }).catch((e) => console.error('PATCH failed too:', e.message));
+    console.error(`[generate-proxy] ${project_id} failed:`, err.message);
+    try {
+      await patchProject(project_id, {
+        proxy_status: "failed",
+        proxy_error: String(err.message || err).slice(0, 500),
+      });
+    } catch (patchErr) {
+      console.error(`[generate-proxy] patch-back failed:`, patchErr.message);
+    }
   } finally {
-    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
   }
 }
 
-module.exports = { generateProxyJob };
-3. Add the route to index.js (in your Railway repo):
-const { generateProxyJob } = require('./proxyGenerator');
+function registerProxyGen(server, API_KEY) {
+  // Wrap existing request handler: if URL matches our route, handle it; otherwise pass through.
+  const previousListener = server.listeners("request")[0];
+  server.removeAllListeners("request");
 
-// ... inside your existing express app, alongside /process:
+  server.on("request", async (req, res) => {
+    if (req.method === "POST" && req.url === "/generate-proxy") {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      let body;
+      try { body = JSON.parse(Buffer.concat(chunks).toString()); }
+      catch { res.writeHead(400); return res.end(JSON.stringify({ error: "bad JSON" })); }
 
-app.post('/generate-proxy', authMiddleware, (req, res) => {
-  const body = req.body || {};
-  const required = ['project_id', 'source_url', 'bucket', 'region', 'proxy_video_key', 'proxy_audio_key'];
-  for (const k of required) {
-    if (!body[k]) return res.status(400).json({ error: `${k} required` });
-  }
-  // Fire-and-forget: respond 202 immediately, run job in background.
-  res.status(202).json({ accepted: true, project_id: body.project_id });
-  generateProxyJob(body).catch((err) => {
-    console.error('[generateProxy] uncaught:', err);
+      const authHeader = req.headers["authorization"] || "";
+      const token = authHeader.replace("Bearer ", "");
+      if (token !== API_KEY && body.api_key !== API_KEY) {
+        res.writeHead(401);
+        return res.end(JSON.stringify({ error: "Unauthorized" }));
+      }
+
+      const required = ["project_id", "source_url", "bucket", "region", "proxy_video_key", "proxy_audio_key"];
+      for (const k of required) {
+        if (!body[k]) {
+          res.writeHead(400);
+          return res.end(JSON.stringify({ error: `${k} required` }));
+        }
+      }
+
+      // Fire-and-forget: respond 202 immediately, run job in background.
+      res.writeHead(202, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ accepted: true, project_id: body.project_id }));
+
+      runProxyJob(body).catch((err) => {
+        console.error("[generate-proxy] uncaught:", err);
+      });
+      return;
+    }
+
+    // Not our route — delegate to the original handler.
+    if (previousListener) previousListener(req, res);
   });
-});
+}
+
+module.exports = { registerProxyGen };
