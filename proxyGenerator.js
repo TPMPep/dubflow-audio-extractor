@@ -12,7 +12,7 @@ const os = require("os");
 const axios = require("axios");
 const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 
-const BASE44_API_URL = process.env.BASE44_API_URL || "https://app.base44.com/api";
+const BASE44_API_URL = process.env.BASE44_API_BASE || process.env.BASE44_API_URL || "https://app.base44.com/api";
 const BASE44_APP_ID = process.env.BASE44_APP_ID;
 const BASE44_SERVICE_TOKEN = process.env.BASE44_SERVICE_TOKEN;
 
