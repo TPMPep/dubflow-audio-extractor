@@ -73,6 +73,7 @@ async function handleHlsIngest(req, res, API_KEY) {
     region,
     output_key,
     credential_secret_prefix = "",
+    audio_codec = "",
   } = body;
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `hls-${hls_ingest_run_id}-`));
@@ -82,18 +83,17 @@ async function handleHlsIngest(req, res, API_KEY) {
   try {
     console.log(`[hls-ingest] ${hls_ingest_run_id} start url=${variant_playlist_url}`);
 
-    // ─── ffmpeg `-c copy` — bit-faithful remux. NEVER re-encode. ───
-    //   -c copy             → no re-encoding (auditor-defensible "we did
-    //                          not alter customer source content")
-    //   -bsf:a aac_adtstoasc → strips ADTS framing on AAC streams when
-    //                          remuxing HLS-TS → MP4. Bitstream filter,
-    //                          NOT re-encoding — audio bytes unchanged.
-    //   -movflags +faststart → moov atom at file head for streamable MP4
-    //   -hide_banner / -loglevel warning / -nostats → quieter logs
+    // Codec-conditional bitstream filter: aac_adtstoasc is AAC-only and
+    // will FAIL on AC-3 / E-AC-3 audio (Apple-style Dolby HLS streams).
+    // Base44's Phase 2 codec gate already pinned the audio codec — branch on it.
+    // Bit-faithful guarantee preserved: -c copy copies bytes for ALL three
+    // codecs; the bsf is just an ADTS->ASC framing reformat for AAC, not a transcode.
+    const isAac = String(audio_codec || "").toLowerCase().startsWith("mp4a");
+    const audioBsfFlag = isAac ? "-bsf:a aac_adtstoasc " : "";
     const cmd =
       `ffmpeg -y -hide_banner -loglevel warning -nostats ` +
       `-i "${variant_playlist_url}" ` +
-      `-c copy -bsf:a aac_adtstoasc -movflags +faststart ` +
+      `-c copy ${audioBsfFlag}-movflags +faststart ` +
       `"${tmpFile}" 2>&1`;
     console.log(`[hls-ingest] ${hls_ingest_run_id} ffmpeg: ${cmd}`);
 
