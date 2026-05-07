@@ -13,6 +13,21 @@
 // Bit-faithful policy: ffmpeg `-c copy` only — no re-encoding. Compliance
 // control hls_remux_pipeline (HLS-INGEST-002) becomes FALSE if you silently
 // add `-c:v libx264` etc. Don't.
+//
+// Codec-conditional bitstream filter: `-bsf:a aac_adtstoasc` is AAC-only and
+// will fail outright on AC-3 / E-AC-3 (Dolby) audio. Base44's Phase 2 codec
+// gate accepts THREE audio codec families (AAC, AC-3, E-AC-3) and pins the
+// resolved codec on the request as `audio_codec`. We branch on it so AAC
+// gets the ADTS→ASC framing reformat (required for browser MP4 playback)
+// while Dolby streams pass through `-c copy` cleanly. All three remain
+// bit-faithful — no transcoding, audio sample bytes unchanged.
+//
+// User-Agent override: ffmpeg's default UA ("Lavf/x.y.z") is rejected by
+// Akamai/CloudFront WAFs as a "bad bot" — manifests fetch fine from Deno
+// but ffmpeg gets HTTP 403. We send the same UA Base44 used on its Phase 1
+// probe so origin logs see ONE consistent client across the pipeline.
+// Auditor-defensible: unique product token, not browser impersonation.
+// `-user_agent` must come BEFORE `-i` to apply to the input.
 
 const { execSync } = require("child_process");
 const fs = require("fs");
@@ -20,10 +35,27 @@ const path = require("path");
 const os = require("os");
 const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 
+const DEFAULT_INGEST_UA = "Mozilla/5.0 (compatible; DubFlowIngest/1.0; +https://dubflow.app/ingest)";
+
 function s3ClientForRegion(region, prefix) {
   const accessKeyId = (prefix && process.env[`${prefix}_ACCESS_KEY_ID`]) || process.env.AWS_ACCESS_KEY_ID;
   const secretAccessKey = (prefix && process.env[`${prefix}_SECRET_ACCESS_KEY`]) || process.env.AWS_SECRET_ACCESS_KEY;
   return new S3Client({ region, credentials: { accessKeyId, secretAccessKey } });
+}
+
+// Build the ffmpeg command. Codec-conditional: AAC gets aac_adtstoasc,
+// AC-3 / E-AC-3 / unknown do NOT (the filter is AAC-only and will fail).
+function buildFfmpegCmd({ inputUrl, outputPath, audioCodec, userAgent }) {
+  const ua = userAgent || DEFAULT_INGEST_UA;
+  const codec = String(audioCodec || "").toLowerCase();
+  const aacBsf = codec.startsWith("mp4a") ? "-bsf:a aac_adtstoasc " : "";
+  return (
+    `ffmpeg -y -hide_banner -loglevel warning -nostats ` +
+    `-user_agent "${ua}" ` +
+    `-i "${inputUrl}" ` +
+    `-c copy ${aacBsf}-movflags +faststart ` +
+    `"${outputPath}" 2>&1`
+  );
 }
 
 function registerHlsIngest(server, API_KEY) {
@@ -73,7 +105,8 @@ async function handleHlsIngest(req, res, API_KEY) {
     region,
     output_key,
     credential_secret_prefix = "",
-    audio_codec = "",
+    audio_codec,   // Pinned by Base44's Phase 2 codec gate. Drives AAC bsf branch.
+    user_agent,    // Optional override; defaults to DEFAULT_INGEST_UA above.
   } = body;
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `hls-${hls_ingest_run_id}-`));
@@ -81,20 +114,14 @@ async function handleHlsIngest(req, res, API_KEY) {
 
   const t0 = Date.now();
   try {
-    console.log(`[hls-ingest] ${hls_ingest_run_id} start url=${variant_playlist_url}`);
+    console.log(`[hls-ingest] ${hls_ingest_run_id} start url=${variant_playlist_url} audio=${audio_codec || "unknown"}`);
 
-    // Codec-conditional bitstream filter: aac_adtstoasc is AAC-only and
-    // will FAIL on AC-3 / E-AC-3 audio (Apple-style Dolby HLS streams).
-    // Base44's Phase 2 codec gate already pinned the audio codec — branch on it.
-    // Bit-faithful guarantee preserved: -c copy copies bytes for ALL three
-    // codecs; the bsf is just an ADTS->ASC framing reformat for AAC, not a transcode.
-    const isAac = String(audio_codec || "").toLowerCase().startsWith("mp4a");
-    const audioBsfFlag = isAac ? "-bsf:a aac_adtstoasc " : "";
-    const cmd =
-      `ffmpeg -y -hide_banner -loglevel warning -nostats ` +
-      `-i "${variant_playlist_url}" ` +
-      `-c copy ${audioBsfFlag}-movflags +faststart ` +
-      `"${tmpFile}" 2>&1`;
+    const cmd = buildFfmpegCmd({
+      inputUrl: variant_playlist_url,
+      outputPath: tmpFile,
+      audioCodec: audio_codec,
+      userAgent: user_agent,
+    });
     console.log(`[hls-ingest] ${hls_ingest_run_id} ffmpeg: ${cmd}`);
 
     try {
