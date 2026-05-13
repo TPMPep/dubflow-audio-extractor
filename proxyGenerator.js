@@ -1,9 +1,15 @@
 // proxyGenerator.js — Background proxy generation for the editor.
 //
-// Pattern matches mixFinal.js: exports a `registerProxyGen(server, API_KEY)`
-// that mounts a POST /generate-proxy route on the existing http server.
-// Returns 202 immediately, runs ffmpeg in the background, then PATCHes the
-// Project entity in Base44 when done (or on failure).
+// Pattern matches mixFinal.js: exports `registerProxyGen(server, API_KEY)` that
+// mounts a POST /generate-proxy route on the existing http server. Returns 202
+// immediately, runs ffmpeg in the background, then POSTs to a Base44 callback
+// URL when done (or on failure).
+//
+// IMPORTANT: This service does NOT patch Base44 entities directly. Base44 sends
+// us a `callback_url` + `callback_secret` in the kickoff payload; we POST the
+// completion event there. Base44 validates the secret and performs the actual
+// Project entity update via its service-role SDK. This is the supported
+// auditor-grade pattern — mirrors how the BullMQ worker is authenticated.
 
 const { execSync } = require("child_process");
 const fs = require("fs");
@@ -12,31 +18,37 @@ const os = require("os");
 const axios = require("axios");
 const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 
-const BASE44_API_URL = process.env.BASE44_API_BASE || process.env.BASE44_API_URL || "https://base44.app/api";
-const BASE44_APP_ID = process.env.BASE44_APP_ID;
-const BASE44_SERVICE_TOKEN = process.env.BASE44_SERVICE_TOKEN;
-
 function s3ClientForRegion(region, prefix) {
   const accessKeyId = (prefix && process.env[`${prefix}_ACCESS_KEY_ID`]) || process.env.AWS_ACCESS_KEY_ID;
   const secretAccessKey = (prefix && process.env[`${prefix}_SECRET_ACCESS_KEY`]) || process.env.AWS_SECRET_ACCESS_KEY;
   return new S3Client({ region, credentials: { accessKeyId, secretAccessKey } });
 }
 
-async function patchProject(projectId, patch) {
-  if (!BASE44_APP_ID || !BASE44_SERVICE_TOKEN) {
-    console.error("[generate-proxy] Missing BASE44_APP_ID or BASE44_SERVICE_TOKEN env var");
+async function postCallback(callback_url, callback_secret, payload) {
+  if (!callback_url || !callback_secret) {
+    console.error("[generate-proxy] Missing callback_url or callback_secret — cannot notify Base44");
     return;
   }
-  await axios.patch(
-    `${BASE44_API_URL}/apps/${BASE44_APP_ID}/entities/Project/${projectId}`,
-    patch,
-    { headers: { "Authorization": `Bearer ${BASE44_SERVICE_TOKEN}`, "Content-Type": "application/json" } }
-  );
+  try {
+    await axios.post(callback_url, payload, {
+      headers: {
+        "Authorization": `Bearer ${callback_secret}`,
+        "Content-Type": "application/json",
+      },
+      timeout: 30000,
+    });
+  } catch (err) {
+    const status = err.response?.status;
+    const body = err.response?.data;
+    console.error(`[generate-proxy] callback failed: HTTP ${status || "?"}`, body || err.message);
+    throw err;
+  }
 }
 
 async function runProxyJob({
   project_id, source_url, bucket, region,
   proxy_video_key, proxy_audio_key, credential_secret_prefix,
+  callback_url, callback_secret,
 }) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `proxy-${project_id}-`));
   const videoPath = path.join(tmpDir, "proxy.mp4");
@@ -73,24 +85,25 @@ async function runProxyJob({
     ]);
 
     const proxyMediaUrl = `https://${bucket}.s3.${region}.amazonaws.com/${proxy_video_key}`;
-    await patchProject(project_id, {
-      proxy_status: "ready",
-      proxy_media_key: proxy_video_key,
-      proxy_audio_key: proxy_audio_key,
+    await postCallback(callback_url, callback_secret, {
+      project_id,
+      status: "ready",
+      proxy_video_key,
+      proxy_audio_key,
       proxy_media_url: proxyMediaUrl,
       proxy_generated_at: new Date().toISOString(),
-      proxy_error: null,
     });
     console.log(`[generate-proxy] ${project_id} ready (video ${(videoBuffer.length / 1024 / 1024).toFixed(0)}MB, audio ${(audioBuffer.length / 1024 / 1024).toFixed(0)}MB)`);
   } catch (err) {
     console.error(`[generate-proxy] ${project_id} failed:`, err.message);
     try {
-      await patchProject(project_id, {
-        proxy_status: "failed",
+      await postCallback(callback_url, callback_secret, {
+        project_id,
+        status: "failed",
         proxy_error: String(err.message || err).slice(0, 500),
       });
-    } catch (patchErr) {
-      console.error(`[generate-proxy] patch-back failed:`, patchErr.message);
+    } catch (cbErr) {
+      console.error(`[generate-proxy] callback-on-failure also failed:`, cbErr.message);
     }
   } finally {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
@@ -117,7 +130,7 @@ function registerProxyGen(server, API_KEY) {
         return res.end(JSON.stringify({ error: "Unauthorized" }));
       }
 
-      const required = ["project_id", "source_url", "bucket", "region", "proxy_video_key", "proxy_audio_key"];
+      const required = ["project_id", "source_url", "bucket", "region", "proxy_video_key", "proxy_audio_key", "callback_url", "callback_secret"];
       for (const k of required) {
         if (!body[k]) {
           res.writeHead(400);
