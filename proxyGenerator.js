@@ -1,15 +1,15 @@
 // proxyGenerator.js — Background proxy generation for the editor.
 //
-// Pattern matches mixFinal.js: exports `registerProxyGen(server, API_KEY)` that
-// mounts a POST /generate-proxy route on the existing http server. Returns 202
-// immediately, runs ffmpeg in the background, then POSTs to a Base44 callback
-// URL when done (or on failure).
+// Pattern matches mixFinal.js: exports a `registerProxyGen(server, API_KEY)`
+// that mounts a POST /generate-proxy route on the existing http server.
+// Returns 202 immediately, runs ffmpeg in the background, then POSTs the
+// completion result back to Base44 via a webhook (proxyGenerationCallback)
+// when done (or on failure).
 //
-// IMPORTANT: This service does NOT patch Base44 entities directly. Base44 sends
-// us a `callback_url` + `callback_secret` in the kickoff payload; we POST the
-// completion event there. Base44 validates the secret and performs the actual
-// Project entity update via its service-role SDK. This is the supported
-// auditor-grade pattern — mirrors how the BullMQ worker is authenticated.
+// Base44 supplies callback_url + callback_secret + callback_app_id in the
+// /generate-proxy kickoff payload. The Base44-App-Id header is REQUIRED by
+// Base44's API gateway — without it the gateway returns HTTP 500 before the
+// callback function ever runs.
 
 const { execSync } = require("child_process");
 const fs = require("fs");
@@ -24,31 +24,26 @@ function s3ClientForRegion(region, prefix) {
   return new S3Client({ region, credentials: { accessKeyId, secretAccessKey } });
 }
 
-async function postCallback(callback_url, callback_secret, payload) {
-  if (!callback_url || !callback_secret) {
-    console.error("[generate-proxy] Missing callback_url or callback_secret — cannot notify Base44");
+// Posts the completion (or failure) result back to Base44 via webhook.
+async function postCallback(callback_url, callback_secret, callback_app_id, payload) {
+  if (!callback_url || !callback_secret || !callback_app_id) {
+    console.error("[generate-proxy] missing callback_url / callback_secret / callback_app_id — cannot report back to Base44");
     return;
   }
-  try {
-    await axios.post(callback_url, payload, {
-      headers: {
-        "Authorization": `Bearer ${callback_secret}`,
-        "Content-Type": "application/json",
-      },
-      timeout: 30000,
-    });
-  } catch (err) {
-    const status = err.response?.status;
-    const body = err.response?.data;
-    console.error(`[generate-proxy] callback failed: HTTP ${status || "?"}`, body || err.message);
-    throw err;
-  }
+  await axios.post(callback_url, payload, {
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${callback_secret}`,
+      "Base44-App-Id": callback_app_id,
+    },
+    timeout: 30000,
+  });
 }
 
 async function runProxyJob({
   project_id, source_url, bucket, region,
   proxy_video_key, proxy_audio_key, credential_secret_prefix,
-  callback_url, callback_secret,
+  callback_url, callback_secret, callback_app_id,
 }) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `proxy-${project_id}-`));
   const videoPath = path.join(tmpDir, "proxy.mp4");
@@ -85,7 +80,7 @@ async function runProxyJob({
     ]);
 
     const proxyMediaUrl = `https://${bucket}.s3.${region}.amazonaws.com/${proxy_video_key}`;
-    await postCallback(callback_url, callback_secret, {
+    await postCallback(callback_url, callback_secret, callback_app_id, {
       project_id,
       status: "ready",
       proxy_video_key,
@@ -97,7 +92,7 @@ async function runProxyJob({
   } catch (err) {
     console.error(`[generate-proxy] ${project_id} failed:`, err.message);
     try {
-      await postCallback(callback_url, callback_secret, {
+      await postCallback(callback_url, callback_secret, callback_app_id, {
         project_id,
         status: "failed",
         proxy_error: String(err.message || err).slice(0, 500),
@@ -130,7 +125,7 @@ function registerProxyGen(server, API_KEY) {
         return res.end(JSON.stringify({ error: "Unauthorized" }));
       }
 
-      const required = ["project_id", "source_url", "bucket", "region", "proxy_video_key", "proxy_audio_key", "callback_url", "callback_secret"];
+      const required = ["project_id", "source_url", "bucket", "region", "proxy_video_key", "proxy_audio_key"];
       for (const k of required) {
         if (!body[k]) {
           res.writeHead(400);
