@@ -6,14 +6,30 @@
 // HTTP connection open for up to 3.5hr, heartbeats its job lock every 15s,
 // and finalizes the Project entity via proxyGenWorkerStep after we return.
 //
-// 2026-05-14 observability fix: switched from execSync (which by default
-// inherits stderr to the parent process, leaving err.stderr empty on
-// non-zero exit) to spawnSync with stdio:'pipe'. The 422 response now
-// includes exit_code, signal, stderr_tail, and stdout_tail so a SOC 2
-// auditor can answer "why did ffmpeg fail on project X?" from the
-// BullMQ failed-job record alone. Also bumped -loglevel from 'error' to
-// 'warning' so non-fatal-but-explanatory warnings (codec mismatches,
-// signed-URL 403s, etc.) reach the captured stderr.
+// Why the rewrite:
+// The legacy /generate-proxy returned 202 + ran execSync in the background
+// + POSTed a callback back to Base44 when done. Three failure modes:
+//   1. execSync starved Node's event loop — /health couldn't answer mid-
+//      transcode (Base44's diagnostic probe saw HTTP 30s aborts).
+//   2. The 202 response and the ffmpeg kickoff raced on the socket buffer
+//      flush — callers timed out before seeing the 202.
+//   3. The webhook callback (proxyGenerationCallback) had no retries, no
+//      observability, no DLQ — a dropped callback left the Project
+//      stuck in 'generating' forever.
+//
+// New endpoint: POST /generate-proxy-sync
+//   • Synchronous reply on the SAME connection (no 202, no callback).
+//   • The worker holds the connection (long-timeout fetch + lock heartbeat).
+//   • spawnSync with stdio piped: stderr/stdout/exit-code/signal are ALL
+//     captured even on failure. Node is single-purpose per request: the
+//     worker is the only caller, only one job runs at a time on this dyno
+//     (CONCURRENCY_PROXY_GEN=1), and the worker holds the connection so
+//     /health responsiveness is no longer the success criterion.
+//
+// The legacy /generate-proxy route is DELETED. Any caller still using it
+// gets a clean 404 — easier to detect + fix than a silent compatibility
+// shim. Base44's generateProxy function has been rewritten to call the
+// BullMQ worker instead of this endpoint directly.
 
 const { spawnSync } = require("child_process");
 const fs = require("fs");
@@ -61,83 +77,84 @@ async function handleProxyGenSync(req, res, API_KEY) {
     credential_secret_prefix = "",
   } = body;
 
+  // Extract source host (no signature / no query) for redacted audit logging.
+  const sourceHost = (() => {
+    try { return new URL(source_url).host; } catch { return "unparseable"; }
+  })();
+
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `proxy-${project_id}-`));
   const videoPath = path.join(tmpDir, "proxy.mp4");
   const audioPath = path.join(tmpDir, "proxy.flac");
 
   try {
-    console.log(`[generate-proxy-sync] ${project_id} starting`);
-
-    // Single ffmpeg pass producing both proxies — only decodes source once.
-    // -loglevel warning (not 'error') so we capture signed-URL 403s,
-    // codec-tag warnings, etc. — the messages that EXPLAIN failures.
-    const ffmpegArgs = [
-      "-hide_banner",
-      "-loglevel", "warning",
-      "-nostdin",
-      "-i", source_url,
-
-      // Video proxy: 720p H.264 ~2 Mbps, AAC 128k stereo
-      "-map", "0:v:0?",
-      "-map", "0:a:0?",
-      "-c:v", "libx264",
-      "-preset", "fast",
-      "-b:v", "2M",
-      "-maxrate", "2.5M",
-      "-bufsize", "4M",
-      "-vf", "scale=-2:720",
-      "-c:a", "aac",
-      "-b:a", "128k",
-      "-ac", "2",
-      "-movflags", "+faststart",
-      "-f", "mp4",
-      videoPath,
-
-      // Audio proxy: 16 kHz mono FLAC for AssemblyAI / Replicate
-      "-map", "0:a:0?",
-      "-vn",
-      "-ac", "1",
-      "-ar", "16000",
-      "-c:a", "flac",
-      "-f", "flac",
-      audioPath,
-    ];
-
-    // spawnSync with explicit stdio:'pipe' captures stderr DETERMINISTICALLY
-    // into ff.stderr — execSync inherits stderr by default which leaves
-    // err.stderr empty on non-zero exit (the bug we just fixed).
-    const ff = spawnSync("ffmpeg", ffmpegArgs, {
-      timeout: 3.5 * 60 * 60 * 1000,
-      maxBuffer: 50 * 1024 * 1024,
-      stdio: ["ignore", "pipe", "pipe"],
+    console.log(`[generate-proxy-sync] ${project_id} starting`, {
+      source_host: sourceHost,
+      bucket,
+      region,
+      video_target: proxy_video_key,
+      audio_target: proxy_audio_key,
     });
 
-    if (ff.status !== 0) {
-      const stderrTail = (ff.stderr || "").toString().slice(-2000);
-      const stdoutTail = (ff.stdout || "").toString().slice(-500);
-      const exitCode = ff.status;
-      const signal = ff.signal;
-      const ffmpegErr = ff.error ? String(ff.error.message || ff.error) : null;
+    // ────────────────────────────────────────────────────────────────────
+    // Single ffmpeg pass producing both proxies — only decodes source once.
+    // Args array (NOT shell string) so spawnSync can capture stderr cleanly
+    // and we don't have shell-quoting issues with signed URLs.
+    // ────────────────────────────────────────────────────────────────────
+    const ffmpegArgs = [
+      "-hide_banner", "-loglevel", "error",
+      "-i", source_url,
+      // Video proxy: 720p H.264 ~2 Mbps, AAC 128k stereo
+      "-map", "0:v:0?", "-map", "0:a:0?",
+      "-c:v", "libx264", "-preset", "fast",
+      "-b:v", "2M", "-maxrate", "2.5M", "-bufsize", "4M",
+      "-vf", "scale=-2:720",
+      "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+      "-movflags", "+faststart",
+      "-f", "mp4", videoPath,
+      // Audio proxy: 16 kHz mono FLAC for AssemblyAI / Replicate
+      "-map", "0:a:0?", "-vn", "-ac", "1", "-ar", "16000",
+      "-c:a", "flac", "-f", "flac", audioPath,
+    ];
 
-      console.error(
-        `[generate-proxy-sync] ${project_id} ffmpeg failed ` +
-        `(exit=${exitCode} signal=${signal} err=${ffmpegErr}):\n${stderrTail}`
-      );
+    // spawnSync with encoding:'utf8' returns stderr/stdout as strings (not
+    // Buffers) and populates them EVEN on non-zero exit — unlike execSync,
+    // which leaves err.stderr as null in many failure paths. This is the
+    // key to enterprise-grade observability: every failure mode is now
+    // legible in the response body AND in Railway's structured logs.
+    const result = spawnSync("ffmpeg", ffmpegArgs, {
+      timeout: 3.5 * 60 * 60 * 1000,
+      maxBuffer: 50 * 1024 * 1024,
+      encoding: "utf8",
+    });
+
+    if (result.status !== 0 || result.signal || result.error) {
+      const stderr = (result.stderr || "").toString();
+      const stdout = (result.stdout || "").toString();
+      const diagnostic = {
+        exit_code: result.status,                              // null if killed by signal
+        signal: result.signal,                                 // SIGKILL=OOM, SIGTERM=timeout
+        stderr_tail: stderr.slice(-2000) || "(empty)",
+        stdout_tail: stdout.slice(-500) || "(empty)",
+        spawn_error_kind: result.error?.code || null,          // ENOENT (ffmpeg missing), ETIMEDOUT, etc.
+        spawn_error_message: result.error?.message || null,
+        source_host: sourceHost,
+        // Redacted argv — replace the full signed URL with just its host
+        // so the audit trail proves what we invoked without leaking the
+        // signature. (SOC 2 CC6.x — secrets never appear in logs.)
+        ffmpeg_argv: ffmpegArgs.map(a => (typeof a === "string" && a.startsWith("http")) ? `<url:${sourceHost}>` : a),
+        duration_ms: Date.now() - t0,
+      };
+      console.error(`[generate-proxy-sync] ${project_id} ffmpeg failed`, diagnostic);
       try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
-
       // 4xx → worker's UnrecoverableError → no retry, straight to DLQ.
       // ffmpeg non-zero exit is deterministic; retrying wastes another
       // 5-15min of compute and produces an identical failure row.
       res.writeHead(422, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({
         error: "proxy_gen_failed",
-        message: `ffmpeg exited ${exitCode}${signal ? ` (signal=${signal})` : ""}${ffmpegErr ? ` — ${ffmpegErr}` : ""}`,
-        exit_code: exitCode,
-        signal: signal || null,
-        spawn_error: ffmpegErr,
-        stderr_tail: stderrTail,
-        stdout_tail: stdoutTail,
+        message: `ffmpeg exit=${result.status} signal=${result.signal || "none"}: ${diagnostic.stderr_tail.slice(-800)}`,
         project_id,
+        diagnostic,
       }));
     }
 
@@ -175,7 +192,7 @@ async function handleProxyGenSync(req, res, API_KEY) {
       project_id,
     }));
   } catch (err) {
-    console.error(`[generate-proxy-sync] ${project_id} fatal:`, err.message);
+    console.error(`[generate-proxy-sync] ${project_id} fatal:`, err.message, err.stack);
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
     // 5xx → worker retries once (BullMQ PROXY_GEN_JOB_OPTIONS.attempts=2).
     // Transient: S3 5xx, transient network blip, ENOENT on tmp.
