@@ -1,6 +1,10 @@
 // /mix-final endpoint — enterprise multi-clip audio mixer.
 // Single FFmpeg pass with filter_complex graph. Eliminates boundary pops
 // and clipping by design. Called by Base44 buildFinalMix function.
+//
+// Supports optional EBU R128 / ITU-R BS.1770 loudness normalization on the
+// final program (post-mix, including M&E bed if present). Industry standard
+// for broadcast and streaming deliverables (Netflix, Apple TV+, EBU, BBC).
 
 const { execSync } = require("child_process");
 const fs = require("fs");
@@ -41,6 +45,22 @@ async function handleMixFinal(req, res, API_KEY) {
   const sampleRate = Number(body.sample_rate || 48000);
   const fadeMs = Math.max(0, Math.min(50, Number(body.fade_ms ?? 8)));
 
+  // EBU R128 loudness normalization target (LUFS).
+  // Accepted values:
+  //   -16 → streaming (Netflix Sound Mix Spec, Apple TV+, Spotify, YouTube)
+  //   -23 → broadcast (EBU R128, ATSC A/85, BBC)
+  //   null / undefined → no normalization (raw mix)
+  // True-peak ceiling is always -1 dBTP. Loudness range 11 LU
+  // (industry-standard envelope — preserves performance dynamics while
+  // controlling overall program loudness).
+  const loudnessTargetLufs = body.loudness_target_lufs != null
+    ? Number(body.loudness_target_lufs)
+    : null;
+  if (loudnessTargetLufs != null && ![-16, -23].includes(loudnessTargetLufs)) {
+    res.writeHead(400);
+    return res.end(JSON.stringify({ error: "loudness_target_lufs must be -16 or -23" }));
+  }
+
   if (clips.length === 0) { res.writeHead(400); return res.end(JSON.stringify({ error: "clips array required and non-empty" })); }
   if (clips.length > MAX_CLIPS) { res.writeHead(400); return res.end(JSON.stringify({ error: `too many clips (max ${MAX_CLIPS})` })); }
   if (!Number.isFinite(durationMs) || durationMs <= 0) { res.writeHead(400); return res.end(JSON.stringify({ error: "duration_ms required and must be > 0" })); }
@@ -68,11 +88,11 @@ async function handleMixFinal(req, res, API_KEY) {
   const fadeSec = fadeMs / 1000;
 
   try {
-    console.log(`[mix-final] ${clips.length} clips, me=${!!meTrack}, dur=${durationMs}ms, fmt=${outputFormat}, sr=${sampleRate}`);
+    console.log(`[mix-final] ${clips.length} clips, me=${!!meTrack}, dur=${durationMs}ms, fmt=${outputFormat}, sr=${sampleRate}, loudnorm=${loudnessTargetLufs ?? "off"}`);
 
     const args = ["-y", "-hide_banner", "-loglevel", "warning", "-nostdin"];
     args.push("-f", "lavfi", "-t", String(durationSec),
-              "-i", `anullsrc=channel_layout=stereo:sample_rate=${sampleRate}`);
+      "-i", `anullsrc=channel_layout=stereo:sample_rate=${sampleRate}`);
     for (const c of clips) args.push("-i", c.url);
     if (meTrack) args.push("-i", meTrack.url);
 
@@ -115,7 +135,15 @@ async function handleMixFinal(req, res, API_KEY) {
       `amix=inputs=${mixLabels.length}:duration=first:normalize=0:dropout_transition=0` +
       `[mix]`
     );
-    filterParts.push(`[mix]atrim=0:${durationSec},asetpts=PTS-STARTPTS[out]`);
+
+    // Final output stage. When loudness normalization is requested, append the
+    // single-pass loudnorm filter (FFmpeg's implementation of ITU-R BS.1770-4).
+    // print_format=summary logs measured input/output LUFS to Railway logs —
+    // auditor evidence that the system can prove what loudness it produced.
+    const loudnormSuffix = loudnessTargetLufs != null
+      ? `,loudnorm=I=${loudnessTargetLufs}:TP=-1:LRA=11:print_format=summary`
+      : "";
+    filterParts.push(`[mix]atrim=0:${durationSec},asetpts=PTS-STARTPTS${loudnormSuffix}[out]`);
 
     const filterComplex = filterParts.join(";");
     const filterFile = `${tmpDir}/filter.txt`;
@@ -137,14 +165,26 @@ async function handleMixFinal(req, res, API_KEY) {
     console.log(`[mix-final] ffmpeg: ${args.length} args, filter graph ${filterComplex.length} bytes`);
 
     const t0 = Date.now();
+    let ffmpegOutput = "";
     try {
-      execSync(cmd, { timeout: 25 * 60 * 1000, maxBuffer: 50 * 1024 * 1024 });
+      ffmpegOutput = execSync(cmd, { timeout: 25 * 60 * 1000, maxBuffer: 50 * 1024 * 1024 }).toString();
     } catch (err) {
       const stderrTail = (err.stdout || err.stderr || "").toString().slice(-2000);
       console.error("[mix-final] ffmpeg failed:", stderrTail);
       try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
       res.writeHead(500, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ error: "ffmpeg failed", stderr_tail: stderrTail }));
+    }
+
+    // If loudnorm ran, log the measured summary block so auditors can read it
+    // back from Railway logs. The summary block contains "Input Integrated",
+    // "Output Integrated", "Output True Peak", etc.
+    if (loudnessTargetLufs != null && ffmpegOutput) {
+      const summaryIdx = ffmpegOutput.indexOf("Input Integrated");
+      if (summaryIdx >= 0) {
+        const summaryTail = ffmpegOutput.slice(summaryIdx, summaryIdx + 600);
+        console.log(`[mix-final] loudnorm summary:\n${summaryTail}`);
+      }
     }
 
     const dt = ((Date.now() - t0) / 1000).toFixed(1);
@@ -155,13 +195,14 @@ async function handleMixFinal(req, res, API_KEY) {
     fs.rmSync(tmpDir, { recursive: true, force: true });
 
     const mime = outputFormat === "wav" ? "audio/wav"
-               : outputFormat === "mp3" ? "audio/mpeg"
-               : "audio/aac";
+      : outputFormat === "mp3" ? "audio/mpeg"
+      : "audio/aac";
     res.writeHead(200, {
       "Content-Type": mime,
       "Content-Length": outputBuffer.length,
       "X-Mix-Duration-Ms": String(durationMs),
       "X-Mix-Clip-Count": String(clips.length),
+      "X-Mix-Loudness-Target-Lufs": loudnessTargetLufs != null ? String(loudnessTargetLufs) : "off",
     });
     return res.end(outputBuffer);
 
