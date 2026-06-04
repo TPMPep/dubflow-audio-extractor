@@ -1,3 +1,5 @@
+/* eslint-env node */
+/* eslint-disable no-undef */
 const http = require("http");
 const { execSync } = require("child_process");
 const fs = require("fs");
@@ -126,6 +128,20 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ error: "audio_url and target_duration_sec required" }));
     }
 
+    // Universal micro-fades (enterprise-grade pop suppression). This endpoint
+    // is THE single fitting pass for every dubbed clip — whether it stretches
+    // (overshoot) or re-encodes at 1.0x tempo (natural fit / no-stretch). Both
+    // paths emerge with identical in/out fades so there is exactly ONE place
+    // fades are ever baked. Optional overrides let the caller tune per clip,
+    // but the defaults are the production contract: 8ms in, 12ms out.
+    //   • 8ms fade-in  — kills the leading transient click on hard onsets.
+    //   • 12ms fade-out — bumped from a shorter tail because near-peak signal
+    //     at the clip end is the dominant audible "pop"; 12ms fully resolves
+    //     it without eating perceptible speech.
+    // Fades are tri (linear) curves — phase-neutral, no DC offset.
+    const fadeInSec = Math.max(0, Number(body.fade_in_ms ?? 8)) / 1000;
+    const fadeOutSec = Math.max(0, Number(body.fade_out_ms ?? 12)) / 1000;
+
     const tmpDir = `/tmp/stretch_${Date.now()}`;
     fs.mkdirSync(tmpDir, { recursive: true });
     const inputFile = `${tmpDir}/input.mp3`;
@@ -163,6 +179,19 @@ const server = http.createServer(async (req, res) => {
         remaining /= 0.5;
       }
       filters.push(`atempo=${remaining.toFixed(6)}`);
+
+      // Append micro-fades AFTER the atempo chain so the fade durations are in
+      // real output-time seconds (atempo changes duration; fades must measure
+      // against the final timeline). The fade-out start is computed from the
+      // TARGET duration since that's the post-stretch length. Guard against
+      // degenerate windows shorter than the fades themselves.
+      const fadeOutStartSec = Math.max(0, target_duration_sec - fadeOutSec);
+      if (fadeInSec > 0 && target_duration_sec > fadeInSec * 2) {
+        filters.push(`afade=t=in:st=0:d=${fadeInSec.toFixed(4)}:curve=tri`);
+      }
+      if (fadeOutSec > 0 && target_duration_sec > fadeOutSec * 2) {
+        filters.push(`afade=t=out:st=${fadeOutStartSec.toFixed(4)}:d=${fadeOutSec.toFixed(4)}:curve=tri`);
+      }
       const filterStr = filters.join(",");
 
       console.log(`FFmpeg filter: ${filterStr}`);
