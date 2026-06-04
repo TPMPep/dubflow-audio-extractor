@@ -20,10 +20,17 @@ const s3 = new S3Client({
 const BUCKET = process.env.S3_BUCKET || "pep-test";
 const API_KEY = process.env.API_KEY || "change-me";
 
+// Build tag — bumped whenever this service changes so /health self-reports the
+// running build. Lets us verify a Railway redeploy actually landed (the same
+// /health-build-tag verification pattern the BullMQ worker uses) before relying
+// on a code path. Current build carries the universal micro-fade bake in
+// /time-stretch (8ms in / 12ms out, post-atempo, tri curves).
+const BUILD_TAG = "extractor-2026-06-04-fade-bake";
+
 const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/health") {
-    res.writeHead(200);
-    return res.end("ok");
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ status: "ok", build_tag: BUILD_TAG }));
   }
 
   // ── Extract speaker audio segments ──
