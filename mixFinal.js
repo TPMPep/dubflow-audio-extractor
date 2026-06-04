@@ -1,3 +1,5 @@
+/* eslint-env node */
+/* eslint-disable no-undef */
 // /mix-final endpoint — enterprise multi-clip audio mixer.
 // Single FFmpeg pass with filter_complex graph. Eliminates boundary pops
 // and clipping by design. Called by Base44 buildFinalMix function.
@@ -43,7 +45,16 @@ async function handleMixFinal(req, res, API_KEY) {
   const durationMs = Number(body.duration_ms);
   const outputFormat = (body.output_format || "wav").toLowerCase();
   const sampleRate = Number(body.sample_rate || 48000);
-  const fadeMs = Math.max(0, Math.min(50, Number(body.fade_ms ?? 8)));
+  // Asymmetric micro-fades on every clip — must match the /time-stretch
+  // fitting pass so the program mix never reintroduces a boundary pop the
+  // fitted clips already suppressed. Defaults are the production contract:
+  // 8ms in, 12ms out (tail bumped because near-peak clip-end signal is the
+  // dominant audible pop). `fade_ms` is kept as a back-compat alias for the
+  // fade-IN value only; legacy callers passing a single fade_ms get 8ms-style
+  // symmetric behavior unless they opt into the asymmetric pair.
+  const _legacyFade = body.fade_ms != null ? Number(body.fade_ms) : null;
+  const fadeInMs = Math.max(0, Math.min(50, Number(body.fade_in_ms ?? _legacyFade ?? 8)));
+  const fadeOutMs = Math.max(0, Math.min(50, Number(body.fade_out_ms ?? _legacyFade ?? 12)));
 
   // EBU R128 loudness normalization target (LUFS).
   // Accepted values:
@@ -85,7 +96,9 @@ async function handleMixFinal(req, res, API_KEY) {
   fs.mkdirSync(tmpDir, { recursive: true });
   const outputFile = `${tmpDir}/out.${outputFormat}`;
   const durationSec = durationMs / 1000;
-  const fadeSec = fadeMs / 1000;
+  const fadeInSec = fadeInMs / 1000;
+  const fadeOutSec = fadeOutMs / 1000;
+  const fadeMs = Math.max(fadeInMs, fadeOutMs); // log/telemetry summary only
 
   try {
     console.log(`[mix-final] ${clips.length} clips, me=${!!meTrack}, dur=${durationMs}ms, fmt=${outputFormat}, sr=${sampleRate}, loudnorm=${loudnessTargetLufs ?? "off"}`);
@@ -105,13 +118,18 @@ async function handleMixFinal(req, res, API_KEY) {
       const idx = i + 1;
       const delay = Math.max(0, Math.round(Number(c.start_ms)));
       const gainDb = Number(c.gain_db) || 0;
+      // Asymmetric micro-fades via the reverse trick: fade-in is applied head-on,
+      // fade-out is applied as a fade-in on the reversed signal (which equals a
+      // fade-out on the forward signal) so we never need the clip's intrinsic
+      // duration to position the tail fade. fadeInSec → leading, fadeOutSec →
+      // trailing. Mirrors the /time-stretch fitting pass exactly.
+      const fadeInPart = fadeInSec > 0 ? `afade=t=in:st=0:d=${fadeInSec}:curve=tri,` : "";
+      const fadeOutPart = fadeOutSec > 0 ? `areverse,afade=t=in:st=0:d=${fadeOutSec}:curve=tri,areverse,` : "";
       const chain =
         `[${idx}:a]` +
         `aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo,` +
-        (fadeMs > 0
-          ? `afade=t=in:st=0:d=${fadeSec}:curve=tri,` +
-            `areverse,afade=t=in:st=0:d=${fadeSec}:curve=tri,areverse,`
-          : "") +
+        fadeInPart +
+        fadeOutPart +
         (gainDb !== 0 ? `volume=${gainDb}dB,` : "") +
         `adelay=${delay}|${delay},` +
         `apad` +
