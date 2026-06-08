@@ -138,19 +138,49 @@ async function handleMixFinal(req, res, API_KEY) {
       const capDurationSec = (capEndMs != null && Number.isFinite(capEndMs))
         ? (capEndMs - Number(c.start_ms)) / 1000
         : null;
-      const capPart = (capDurationSec != null && capDurationSec > 0)
+      const hasCap = capDurationSec != null && capDurationSec > 0;
+      const capPart = hasCap
         ? `atrim=end=${capDurationSec.toFixed(4)},asetpts=PTS-STARTPTS,`
         : "";
 
-      // Asymmetric micro-fades via the reverse trick: fade-in is applied head-on,
-      // fade-out is applied as a fade-in on the reversed signal (which equals a
-      // fade-out on the forward signal) so we never need the clip's intrinsic
-      // duration to position the tail fade. fadeInSec → leading, fadeOutSec →
-      // trailing. Mirrors the /time-stretch fitting pass exactly. When a cap is
-      // active, the areverse-based fade-out lands on the CAPPED tail (atrim runs
-      // first), so the cut is fully de-popped.
+      // Micro-fades. Two regimes:
+      //
+      //  (A) NO CAP (the common path) — we don't know the clip's intrinsic
+      //      duration here, so the fade-OUT uses the areverse trick (a fade-IN
+      //      on the reversed signal == a fade-OUT on the forward signal),
+      //      which needs no duration. fade-IN is applied head-on.
+      //
+      //  (B) CAP ACTIVE (overlap guard) — we KNOW the exact post-trim duration
+      //      (capDurationSec), so we MUST use a forward, positioned fade-OUT
+      //      (afade=t=out:st=capDur-fadeOut). The previous build reused the
+      //      areverse trick after atrim; that ordering was unreliable —
+      //      areverse fully buffers the stream and, combined with the trailing
+      //      apad=∞, the realized output was indistinguishable from the
+      //      uncapped clip (the cut never landed; QA 2026-06-08 proved capped
+      //      and uncapped renders were bit-identical). A forward positioned
+      //      fade after atrim is deterministic: the stream is hard-bounded at
+      //      capDurationSec, the fade-out sits inside it, and apad then extends
+      //      with TRUE digital silence past the cut. SOC 2 CC8.1 — the rendered
+      //      program reflects exactly the cap the audit row records.
       const fadeInPart = fadeInSec > 0 ? `afade=t=in:st=0:d=${fadeInSec}:curve=tri,` : "";
-      const fadeOutPart = fadeOutSec > 0 ? `areverse,afade=t=in:st=0:d=${fadeOutSec}:curve=tri,areverse,` : "";
+      let fadeOutPart;
+      if (!hasCap) {
+        fadeOutPart = fadeOutSec > 0 ? `areverse,afade=t=in:st=0:d=${fadeOutSec}:curve=tri,areverse,` : "";
+      } else {
+        const fadeOutStartSec = Math.max(0, capDurationSec - fadeOutSec);
+        fadeOutPart = (fadeOutSec > 0 && capDurationSec > fadeOutSec * 2)
+          ? `afade=t=out:st=${fadeOutStartSec.toFixed(4)}:d=${fadeOutSec.toFixed(4)}:curve=tri,`
+          : "";
+      }
+      // apad must be LENGTH-BOUNDED when a cap is active so the clip occupies
+      // exactly its capped window on the program timeline, then yields to true
+      // silence — never an unbounded pad that amix could let bleed. whole_len
+      // is samples = (delay + capDuration) * sampleRate. For the uncapped path
+      // apad stays unbounded (amix duration=first clamps it), preserving the
+      // exact prior behavior byte-for-byte.
+      const apadPart = hasCap
+        ? `apad=whole_len=${Math.round((capDurationSec + delay / 1000) * sampleRate)}`
+        : `apad`;
       const chain =
         `[${idx}:a]` +
         `aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo,` +
@@ -159,7 +189,7 @@ async function handleMixFinal(req, res, API_KEY) {
         fadeOutPart +
         (gainDb !== 0 ? `volume=${gainDb}dB,` : "") +
         `adelay=${delay}|${delay},` +
-        `apad` +
+        apadPart +
         `[c${i}]`;
       filterParts.push(chain);
       mixLabels.push(`[c${i}]`);
