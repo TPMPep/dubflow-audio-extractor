@@ -11,6 +11,12 @@
 const { execSync } = require("child_process");
 const fs = require("fs");
 
+// Module-level build identifier for /mix-final, sourced from THIS file (not
+// index.js). Emitted as the X-MixFinal-Build response header on every render so
+// a partial deploy — bumped index.js build tag but stale mixFinal.js — is
+// independently detectable. Bump whenever the mix-final graph logic changes.
+const MIXFINAL_BUILD = "mixfinal-overlap-guard-2";
+
 function registerMixFinal(server, API_KEY) {
   const originalListeners = server.listeners("request").slice();
   server.removeAllListeners("request");
@@ -278,6 +284,7 @@ async function handleMixFinal(req, res, API_KEY) {
       "X-Mix-Duration-Ms": String(durationMs),
       "X-Mix-Clip-Count": String(clips.length),
       "X-Mix-Loudness-Target-Lufs": loudnessTargetLufs != null ? String(loudnessTargetLufs) : "off",
+      "X-MixFinal-Build": MIXFINAL_BUILD,
     });
     return res.end(outputBuffer);
 
