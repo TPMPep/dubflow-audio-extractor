@@ -118,16 +118,43 @@ async function handleMixFinal(req, res, API_KEY) {
       const idx = i + 1;
       const delay = Math.max(0, Math.round(Number(c.start_ms)));
       const gainDb = Number(c.gain_db) || 0;
+
+      // ── Phase 4: export overlap guard — per-clip playback-length cap ──────────
+      // When the caller (buildFinalMix) detects that this clip's fitted audio
+      // would overrun the NEXT clip's start, it sends an absolute timeline
+      // `end_ms` (= next clip's start). We translate that into a clip-RELATIVE
+      // playback length and apply an `atrim` on the clip's OWN pre-delay
+      // timeline (atrim measures from t=0 of the input stream, BEFORE adelay
+      // shifts it onto the program timeline). capDurationSec = end_ms - start_ms.
+      // This is purely non-destructive: the stored fitted asset is untouched;
+      // we only stop reading it early in this one mix. The trim runs BEFORE the
+      // fade-out (areverse) so the 12ms tail fade lands on the NEW, capped end —
+      // no boundary pop at the cut. A cap that is absent, non-positive, or not
+      // shorter than the clip is a no-op (atrim only ever shortens). atrim is
+      // applied first in the chain so every downstream filter sees the capped
+      // signal. SOC 2 CC8.1 — the rendered program reflects exactly the cap the
+      // audit row records.
+      const capEndMs = (c.end_ms != null) ? Number(c.end_ms) : null;
+      const capDurationSec = (capEndMs != null && Number.isFinite(capEndMs))
+        ? (capEndMs - Number(c.start_ms)) / 1000
+        : null;
+      const capPart = (capDurationSec != null && capDurationSec > 0)
+        ? `atrim=end=${capDurationSec.toFixed(4)},asetpts=PTS-STARTPTS,`
+        : "";
+
       // Asymmetric micro-fades via the reverse trick: fade-in is applied head-on,
       // fade-out is applied as a fade-in on the reversed signal (which equals a
       // fade-out on the forward signal) so we never need the clip's intrinsic
       // duration to position the tail fade. fadeInSec → leading, fadeOutSec →
-      // trailing. Mirrors the /time-stretch fitting pass exactly.
+      // trailing. Mirrors the /time-stretch fitting pass exactly. When a cap is
+      // active, the areverse-based fade-out lands on the CAPPED tail (atrim runs
+      // first), so the cut is fully de-popped.
       const fadeInPart = fadeInSec > 0 ? `afade=t=in:st=0:d=${fadeInSec}:curve=tri,` : "";
       const fadeOutPart = fadeOutSec > 0 ? `areverse,afade=t=in:st=0:d=${fadeOutSec}:curve=tri,areverse,` : "";
       const chain =
         `[${idx}:a]` +
         `aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo,` +
+        capPart +
         fadeInPart +
         fadeOutPart +
         (gainDb !== 0 ? `volume=${gainDb}dB,` : "") +
