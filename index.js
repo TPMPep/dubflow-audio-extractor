@@ -25,7 +25,7 @@ const API_KEY = process.env.API_KEY || "change-me";
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. Current build carries the universal micro-fade bake in
 // /time-stretch (8ms in / 12ms out, post-atempo, tri curves).
-const BUILD_TAG = "extractor-2026-06-08-duration-headers";
+const BUILD_TAG = "extractor-2026-06-08-overlap-guard";
 
 const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/health") {
