@@ -25,7 +25,7 @@ const API_KEY = process.env.API_KEY || "change-me";
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. Current build carries the universal micro-fade bake in
 // /time-stretch (8ms in / 12ms out, post-atempo, tri curves).
-const BUILD_TAG = "extractor-2026-06-04-fade-bake";
+const BUILD_TAG = "extractor-2026-06-08-duration-headers";
 
 const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/health") {
@@ -211,9 +211,34 @@ const server = http.createServer(async (req, res) => {
       const stretchedBuffer = fs.readFileSync(outputFile);
       console.log(`Stretched audio: ${(stretchedBuffer.length / 1024).toFixed(0)}KB`);
 
+      // Duration-truthing headers (Tier 2, 2026-06-08). Probe the ACTUAL
+      // FFmpeg output so the caller can store the measured fitted length
+      // instead of trusting the requested target. The input duration was
+      // already probed above (originalDuration). Both are emitted as response
+      // HEADERS so the body stays binary audio — zero contract break for
+      // callers that ignore them. ffprobe on the output must NEVER fail the
+      // (already-successful) audio response: a probe error degrades the
+      // output-duration header to absent, not the whole request.
+      const durationHeaders = {};
+      if (Number.isFinite(originalDuration) && originalDuration > 0) {
+        durationHeaders["X-Input-Duration-Ms"] = String(Math.round(originalDuration * 1000));
+      }
+      try {
+        const outProbe = execSync(
+          `ffprobe -v quiet -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${outputFile}"`,
+          { timeout: 10000 }
+        ).toString().trim();
+        const outDurationSec = parseFloat(outProbe);
+        if (Number.isFinite(outDurationSec) && outDurationSec > 0) {
+          durationHeaders["X-Output-Duration-Ms"] = String(Math.round(outDurationSec * 1000));
+        }
+      } catch (probeErr) {
+        console.warn(`[time-stretch] output duration probe failed (non-fatal): ${probeErr.message}`);
+      }
+
       fs.rmSync(tmpDir, { recursive: true, force: true });
 
-      res.writeHead(200, { "Content-Type": "audio/mpeg" });
+      res.writeHead(200, { "Content-Type": "audio/mpeg", ...durationHeaders });
       res.end(stretchedBuffer);
 
     } catch (err) {
@@ -299,8 +324,27 @@ const server = http.createServer(async (req, res) => {
       const outputBuffer = fs.readFileSync(outputFile);
       console.log(`[process] Output: ${(outputBuffer.length / 1024).toFixed(0)}KB`);
 
+      // Duration-truthing header (Tier 2, 2026-06-08). /process is the
+      // identity-shift output path; probe the actual output so the caller can
+      // store the MEASURED raw-dub length instead of the byteLength/16000
+      // estimate. Emitted as a response HEADER so the binary body contract is
+      // untouched. ffprobe failure is non-fatal — degrades to absent header.
+      const processDurationHeaders = {};
+      try {
+        const procProbe = execSync(
+          `ffprobe -v quiet -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${outputFile}"`,
+          { timeout: 10000 }
+        ).toString().trim();
+        const procDurationSec = parseFloat(procProbe);
+        if (Number.isFinite(procDurationSec) && procDurationSec > 0) {
+          processDurationHeaders["X-Output-Duration-Ms"] = String(Math.round(procDurationSec * 1000));
+        }
+      } catch (probeErr) {
+        console.warn(`[process] output duration probe failed (non-fatal): ${probeErr.message}`);
+      }
+
       fs.rmSync(tmpDir, { recursive: true, force: true });
-      res.writeHead(200, { "Content-Type": `audio/${output_format}` });
+      res.writeHead(200, { "Content-Type": `audio/${output_format}`, ...processDurationHeaders });
       res.end(outputBuffer);
     } catch (err) {
       console.error("[process] Error:", err.message);
