@@ -15,7 +15,7 @@ const fs = require("fs");
 // index.js). Emitted as the X-MixFinal-Build response header on every render so
 // a partial deploy — bumped index.js build tag but stale mixFinal.js — is
 // independently detectable. Bump whenever the mix-final graph logic changes.
-const MIXFINAL_BUILD = "mixfinal-overlap-guard-2";
+const MIXFINAL_BUILD = "mixfinal-overlap-guard-3";
 
 function registerMixFinal(server, API_KEY) {
   const originalListeners = server.listeners("request").slice();
@@ -178,15 +178,22 @@ async function handleMixFinal(req, res, API_KEY) {
           ? `afade=t=out:st=${fadeOutStartSec.toFixed(4)}:d=${fadeOutSec.toFixed(4)}:curve=tri,`
           : "";
       }
-      // apad must be LENGTH-BOUNDED when a cap is active so the clip occupies
-      // exactly its capped window on the program timeline, then yields to true
-      // silence — never an unbounded pad that amix could let bleed. whole_len
-      // is samples = (delay + capDuration) * sampleRate. For the uncapped path
-      // apad stays unbounded (amix duration=first clamps it), preserving the
-      // exact prior behavior byte-for-byte.
-      const apadPart = hasCap
-        ? `apad=whole_len=${Math.round((capDurationSec + delay / 1000) * sampleRate)}`
-        : `apad`;
+      // apad is ALWAYS unbounded — capped AND uncapped. This was the root cause
+      // of the QA-2026-06-08 failure: a LENGTH-BOUNDED apad on capped clips made
+      // the clip end its stream early, at which point amix (dropout_transition=0)
+      // HELD the clip's last sample for the remainder of the program instead of
+      // dropping it — so the cut never appeared in the rendered audio (capped and
+      // uncapped renders were bit-identical, speech_end ≈ full length). The cut
+      // itself comes ENTIRELY from `atrim=end=capDurationSec` at the head of the
+      // chain, which hard-bounds the SIGNAL to exactly capDurationSec. `apad`
+      // (unbounded) then extends that already-cut signal with TRUE digital
+      // silence to infinity, so amix=duration=first never sees a dropout and
+      // simply clamps the whole program to the base length. The window after the
+      // cut is therefore pure silence — the clip's audio genuinely stops at the
+      // cap. This is the IDENTICAL apad posture as the uncapped path, so amix
+      // dropout behavior is consistent for every clip. SOC 2 CC8.1 — the rendered
+      // program reflects exactly the cap the audit row records.
+      const apadPart = `apad`;
       const chain =
         `[${idx}:a]` +
         `aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo,` +
