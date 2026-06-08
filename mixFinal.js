@@ -11,12 +11,6 @@
 const { execSync } = require("child_process");
 const fs = require("fs");
 
-// Module-level build identifier for /mix-final, sourced from THIS file (not
-// index.js). Emitted as the X-MixFinal-Build response header on every render so
-// a partial deploy — bumped index.js build tag but stale mixFinal.js — is
-// independently detectable. Bump whenever the mix-final graph logic changes.
-const MIXFINAL_BUILD = "mixfinal-overlap-guard-3";
-
 function registerMixFinal(server, API_KEY) {
   const originalListeners = server.listeners("request").slice();
   server.removeAllListeners("request");
@@ -125,84 +119,21 @@ async function handleMixFinal(req, res, API_KEY) {
       const delay = Math.max(0, Math.round(Number(c.start_ms)));
       const gainDb = Number(c.gain_db) || 0;
 
-      // ── Phase 4: export overlap guard — per-clip playback-length cap ──────────
-      // When the caller (buildFinalMix) detects that this clip's fitted audio
-      // would overrun the NEXT clip's start, it sends an absolute timeline
-      // `end_ms` (= next clip's start). We translate that into a clip-RELATIVE
-      // playback length and apply an `atrim` on the clip's OWN pre-delay
-      // timeline (atrim measures from t=0 of the input stream, BEFORE adelay
-      // shifts it onto the program timeline). capDurationSec = end_ms - start_ms.
-      // This is purely non-destructive: the stored fitted asset is untouched;
-      // we only stop reading it early in this one mix. The trim runs BEFORE the
-      // fade-out (areverse) so the 12ms tail fade lands on the NEW, capped end —
-      // no boundary pop at the cut. A cap that is absent, non-positive, or not
-      // shorter than the clip is a no-op (atrim only ever shortens). atrim is
-      // applied first in the chain so every downstream filter sees the capped
-      // signal. SOC 2 CC8.1 — the rendered program reflects exactly the cap the
-      // audit row records.
-      const capEndMs = (c.end_ms != null) ? Number(c.end_ms) : null;
-      const capDurationSec = (capEndMs != null && Number.isFinite(capEndMs))
-        ? (capEndMs - Number(c.start_ms)) / 1000
-        : null;
-      const hasCap = capDurationSec != null && capDurationSec > 0;
-      const capPart = hasCap
-        ? `atrim=end=${capDurationSec.toFixed(4)},asetpts=PTS-STARTPTS,`
-        : "";
-
-      // Micro-fades. Two regimes:
-      //
-      //  (A) NO CAP (the common path) — we don't know the clip's intrinsic
-      //      duration here, so the fade-OUT uses the areverse trick (a fade-IN
-      //      on the reversed signal == a fade-OUT on the forward signal),
-      //      which needs no duration. fade-IN is applied head-on.
-      //
-      //  (B) CAP ACTIVE (overlap guard) — we KNOW the exact post-trim duration
-      //      (capDurationSec), so we MUST use a forward, positioned fade-OUT
-      //      (afade=t=out:st=capDur-fadeOut). The previous build reused the
-      //      areverse trick after atrim; that ordering was unreliable —
-      //      areverse fully buffers the stream and, combined with the trailing
-      //      apad=∞, the realized output was indistinguishable from the
-      //      uncapped clip (the cut never landed; QA 2026-06-08 proved capped
-      //      and uncapped renders were bit-identical). A forward positioned
-      //      fade after atrim is deterministic: the stream is hard-bounded at
-      //      capDurationSec, the fade-out sits inside it, and apad then extends
-      //      with TRUE digital silence past the cut. SOC 2 CC8.1 — the rendered
-      //      program reflects exactly the cap the audit row records.
+      // Asymmetric micro-fades on every clip. The fade-OUT uses the areverse
+      // trick (a fade-IN on the reversed signal == a fade-OUT on the forward
+      // signal), which needs no knowledge of the clip's intrinsic duration.
+      // fade-IN is applied head-on. apad extends each clip with digital silence
+      // so amix=duration=first clamps the program to the base track length.
       const fadeInPart = fadeInSec > 0 ? `afade=t=in:st=0:d=${fadeInSec}:curve=tri,` : "";
-      let fadeOutPart;
-      if (!hasCap) {
-        fadeOutPart = fadeOutSec > 0 ? `areverse,afade=t=in:st=0:d=${fadeOutSec}:curve=tri,areverse,` : "";
-      } else {
-        const fadeOutStartSec = Math.max(0, capDurationSec - fadeOutSec);
-        fadeOutPart = (fadeOutSec > 0 && capDurationSec > fadeOutSec * 2)
-          ? `afade=t=out:st=${fadeOutStartSec.toFixed(4)}:d=${fadeOutSec.toFixed(4)}:curve=tri,`
-          : "";
-      }
-      // apad is ALWAYS unbounded — capped AND uncapped. This was the root cause
-      // of the QA-2026-06-08 failure: a LENGTH-BOUNDED apad on capped clips made
-      // the clip end its stream early, at which point amix (dropout_transition=0)
-      // HELD the clip's last sample for the remainder of the program instead of
-      // dropping it — so the cut never appeared in the rendered audio (capped and
-      // uncapped renders were bit-identical, speech_end ≈ full length). The cut
-      // itself comes ENTIRELY from `atrim=end=capDurationSec` at the head of the
-      // chain, which hard-bounds the SIGNAL to exactly capDurationSec. `apad`
-      // (unbounded) then extends that already-cut signal with TRUE digital
-      // silence to infinity, so amix=duration=first never sees a dropout and
-      // simply clamps the whole program to the base length. The window after the
-      // cut is therefore pure silence — the clip's audio genuinely stops at the
-      // cap. This is the IDENTICAL apad posture as the uncapped path, so amix
-      // dropout behavior is consistent for every clip. SOC 2 CC8.1 — the rendered
-      // program reflects exactly the cap the audit row records.
-      const apadPart = `apad`;
+      const fadeOutPart = fadeOutSec > 0 ? `areverse,afade=t=in:st=0:d=${fadeOutSec}:curve=tri,areverse,` : "";
       const chain =
         `[${idx}:a]` +
         `aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo,` +
-        capPart +
         fadeInPart +
         fadeOutPart +
         (gainDb !== 0 ? `volume=${gainDb}dB,` : "") +
         `adelay=${delay}|${delay},` +
-        apadPart +
+        `apad` +
         `[c${i}]`;
       filterParts.push(chain);
       mixLabels.push(`[c${i}]`);
@@ -291,7 +222,6 @@ async function handleMixFinal(req, res, API_KEY) {
       "X-Mix-Duration-Ms": String(durationMs),
       "X-Mix-Clip-Count": String(clips.length),
       "X-Mix-Loudness-Target-Lufs": loudnessTargetLufs != null ? String(loudnessTargetLufs) : "off",
-      "X-MixFinal-Build": MIXFINAL_BUILD,
     });
     return res.end(outputBuffer);
 
