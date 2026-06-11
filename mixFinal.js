@@ -129,16 +129,51 @@ async function handleMixFinal(req, res, API_KEY) {
       const delay = Math.max(0, Math.round(Number(c.start_ms)));
       const gainDb = Number(c.gain_db) || 0;
 
+      // ── RENDER PARITY (A′) — per-clip trim to the next-clip boundary ──────
+      // The editor plays clips sequentially and cuts each clip the instant the
+      // NEXT dubbed clip starts (MediaPlayer's activeSegId switch). To make the
+      // export match exactly, the producer passes max_duration_ms = (next clip
+      // start − this clip start) for any clip whose audio would otherwise
+      // overrun the next clip. We atrim the SOURCE clip to that length BEFORE
+      // the fade-out + delay, so the clip stops precisely where the editor cuts
+      // it — what-you-hear == what-exports. When max_duration_ms is absent/null
+      // the clip rings out into the gap untouched (faithful to the editor too).
+      // The integrity gate upstream (preflightExportClips / buildFinalMix) has
+      // already BLOCKED any clip whose REAL audio would be clipped mid-word, so
+      // by the time we trim here it is always a clean, intentional boundary.
+      // ── SPEED-TO-FIT (single source of truth) ────────────────────────────
+      // The editor plays the natural-dub buffer at AudioBufferSourceNode
+      // .playbackRate when the operator sets Speed-to-Fit. atempo reproduces the
+      // SAME tempo change here (pitch-preserved), applied FIRST so the trim +
+      // fades land on the sped-up signal exactly as the editor cuts the sped-up
+      // buffer. Omitted/1 = native speed. atempo's valid range is [0.5, 2.0],
+      // matching the editor's clamp, so a single stage always covers it.
+      const rate = Number(c.playback_rate);
+      const tempoPart = (Number.isFinite(rate) && rate > 0 && Math.abs(rate - 1) > 0.001)
+        ? `atempo=${Math.max(0.5, Math.min(2.0, rate)).toFixed(4)},`
+        : "";
+
+      // The trim boundary is measured AFTER the tempo change (it's the length
+      // the editor hears), so atrim runs on the post-atempo signal.
+      const maxDurMs = Number(c.max_duration_ms);
+      const trimPart = (Number.isFinite(maxDurMs) && maxDurMs > 0)
+        ? `atrim=end=${(maxDurMs / 1000).toFixed(4)},`
+        : "";
+
       // Asymmetric micro-fades on every clip. The fade-OUT uses the areverse
       // trick (a fade-IN on the reversed signal == a fade-OUT on the forward
       // signal), which needs no knowledge of the clip's intrinsic duration.
       // fade-IN is applied head-on. apad extends each clip with digital silence
       // so amix=duration=first clamps the program to the base track length.
+      // NOTE: the trim runs FIRST so the fade-out lands on the trimmed tail
+      // (a clean boundary cut), never on the original (longer) clip end.
       const fadeInPart = fadeInSec > 0 ? `afade=t=in:st=0:d=${fadeInSec}:curve=tri,` : "";
       const fadeOutPart = fadeOutSec > 0 ? `areverse,afade=t=in:st=0:d=${fadeOutSec}:curve=tri,areverse,` : "";
       const chain =
         `[${idx}:a]` +
         `aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo,` +
+        tempoPart +
+        trimPart +
         fadeInPart +
         fadeOutPart +
         (gainDb !== 0 ? `volume=${gainDb}dB,` : "") +
