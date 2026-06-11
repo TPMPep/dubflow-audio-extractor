@@ -6,6 +6,7 @@ const fs = require("fs");
 const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 const { registerMixFinal } = require("./mixFinal");
+const { registerMuxVideo } = require("./muxVideo");
 const { registerProxyGen } = require("./proxyGenerator");
 const { registerHlsIngest } = require("./hlsIngest");
 
@@ -25,7 +26,7 @@ const API_KEY = process.env.API_KEY || "change-me";
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. Current build carries the universal micro-fade bake in
 // /time-stretch (8ms in / 12ms out, post-atempo, tri curves).
-const BUILD_TAG = "extractor-2026-06-08-overlap-guard-3";
+const BUILD_TAG = "extractor-2026-06-11-video-mux";
 
 const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/health") {
@@ -706,6 +707,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 registerMixFinal(server, API_KEY);
+registerMuxVideo(server, API_KEY);
 registerProxyGen(server, API_KEY);
 registerHlsIngest(server, API_KEY);
 server.listen(3000, () => console.log("Audio extractor running on port 3000"));
