@@ -42,6 +42,12 @@ async function handleMixFinal(req, res, API_KEY) {
   const MAX_DURATION_MS = 4 * 3600 * 1000;
   const clips = Array.isArray(body.clips) ? body.clips : [];
   const meTrack = body.me_track || null;
+  // Original-language dialogue (isolated vocals) stem — the THIRD mixing-console
+  // input. Optional and additive: present only when the operator's mix recipe
+  // includes the original dialogue (bilingual QC, faint reference bed, etc.).
+  // Same shape + same filter-graph treatment as me_track (a full-program stem
+  // with its own gain), so the 3-fader console maps 1:1 onto three FFmpeg inputs.
+  const vocalsTrack = body.vocals_track || null;
   const durationMs = Number(body.duration_ms);
   const outputFormat = (body.output_format || "wav").toLowerCase();
   const sampleRate = Number(body.sample_rate || 48000);
@@ -91,6 +97,9 @@ async function handleMixFinal(req, res, API_KEY) {
   if (meTrack && (typeof meTrack !== "object" || typeof meTrack.url !== "string")) {
     res.writeHead(400); return res.end(JSON.stringify({ error: "me_track.url required when me_track is set" }));
   }
+  if (vocalsTrack && (typeof vocalsTrack !== "object" || typeof vocalsTrack.url !== "string")) {
+    res.writeHead(400); return res.end(JSON.stringify({ error: "vocals_track.url required when vocals_track is set" }));
+  }
 
   const tmpDir = `/tmp/mix_${Date.now()}`;
   fs.mkdirSync(tmpDir, { recursive: true });
@@ -101,13 +110,14 @@ async function handleMixFinal(req, res, API_KEY) {
   const fadeMs = Math.max(fadeInMs, fadeOutMs); // log/telemetry summary only
 
   try {
-    console.log(`[mix-final] ${clips.length} clips, me=${!!meTrack}, dur=${durationMs}ms, fmt=${outputFormat}, sr=${sampleRate}, loudnorm=${loudnessTargetLufs ?? "off"}`);
+    console.log(`[mix-final] ${clips.length} clips, me=${!!meTrack}, vocals=${!!vocalsTrack}, dur=${durationMs}ms, fmt=${outputFormat}, sr=${sampleRate}, loudnorm=${loudnessTargetLufs ?? "off"}`);
 
     const args = ["-y", "-hide_banner", "-loglevel", "warning", "-nostdin"];
     args.push("-f", "lavfi", "-t", String(durationSec),
       "-i", `anullsrc=channel_layout=stereo:sample_rate=${sampleRate}`);
     for (const c of clips) args.push("-i", c.url);
     if (meTrack) args.push("-i", meTrack.url);
+    if (vocalsTrack) args.push("-i", vocalsTrack.url);
 
     const filterParts = [];
     filterParts.push(`[0:a]aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo[base]`);
@@ -147,6 +157,20 @@ async function handleMixFinal(req, res, API_KEY) {
         `volume=${meGain}dB[me]`
       );
       mixLabels.push("[me]");
+    }
+
+    // Original-language dialogue (isolated vocals) stem — mixed in at its own
+    // gain when present. Input index sits AFTER the M&E track: base(0) +
+    // clips(1..N) + me(N+1, when present) + vocals(next). Computed from the
+    // actual presence of meTrack so the index is always correct.
+    if (vocalsTrack) {
+      const vocalsIdx = clips.length + 1 + (meTrack ? 1 : 0);
+      const vocalsGain = Number(vocalsTrack.gain_db ?? -18);
+      filterParts.push(
+        `[${vocalsIdx}:a]aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo,` +
+        `volume=${vocalsGain}dB[vox]`
+      );
+      mixLabels.push("[vox]");
     }
 
     filterParts.push(
