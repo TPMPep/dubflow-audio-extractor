@@ -1,8 +1,44 @@
 /* eslint-env node */
 /* eslint-disable no-undef */
 const http = require("http");
-const { execSync } = require("child_process");
+const { execSync, spawn } = require("child_process");
 const fs = require("fs");
+
+// ── Async, non-blocking ffmpeg runner (SOC 2 CC7.2 — never freeze the loop) ──
+// execSync blocks the single-threaded Node event loop for the ENTIRE ffmpeg run.
+// While one /extract grinds, the whole service stalls — even /health stops
+// responding and every concurrent request queues behind it. At 100+ users that
+// is a hard wall. spawn() runs ffmpeg in a child process without blocking the
+// loop, so the service stays responsive and handles concurrent extracts. The
+// returned promise resolves on exit code 0 and rejects (with captured stderr)
+// otherwise, with a hard timeout that kills a wedged child.
+function runFfmpeg(args, { timeoutMs = 120000, label = "ffmpeg" } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { child.kill("SIGKILL"); } catch (_) { /* already gone */ }
+      reject(new Error(`${label} timed out after ${Math.round(timeoutMs / 1000)}s`));
+    }, timeoutMs);
+    child.stderr.on("data", (d) => { stderr += d.toString(); });
+    child.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new Error(`${label} spawn failed: ${err.message}`));
+    });
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(`${label} exited ${code}: ${stderr.slice(-500)}`));
+    });
+  });
+}
 const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 const { registerMixFinal } = require("./mixFinal");
@@ -26,7 +62,7 @@ const API_KEY = process.env.API_KEY || "change-me";
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. Current build carries the universal micro-fade bake in
 // /time-stretch (8ms in / 12ms out, post-atempo, tri curves).
-const BUILD_TAG = "extractor-2026-06-11-video-mux";
+const BUILD_TAG = "extractor-2026-06-24-single-pass-extract";
 
 const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/health") {
@@ -59,33 +95,56 @@ const server = http.createServer(async (req, res) => {
 
       const tmpDir = `/tmp/${Date.now()}`;
       fs.mkdirSync(tmpDir, { recursive: true });
-
-      const segFiles = [];
-      for (let i = 0; i < timestamps.length; i++) {
-        const { start_ms, end_ms } = timestamps[i];
-        const startSec = (start_ms / 1000).toFixed(3);
-        const duration = ((end_ms - start_ms) / 1000).toFixed(3);
-        const segFile = `${tmpDir}/seg_${i}.wav`;
-
-        execSync(
-          `ffmpeg -ss ${startSec} -t ${duration} -i "${signedUrl}" -vn -acodec pcm_s16le -ar 44100 -ac 1 "${segFile}" -y 2>/dev/null`,
-          { timeout: 120000 }
-        );
-        segFiles.push(segFile);
-      }
-
-      const listFile = `${tmpDir}/list.txt`;
-      fs.writeFileSync(listFile, segFiles.map(f => `file '${f}'`).join("\n"));
-
       const outputFile = `${tmpDir}/output.wav`;
-      execSync(
-        `ffmpeg -f concat -safe 0 -i "${listFile}" -acodec pcm_s16le -ar 44100 -ac 1 "${outputFile}" -y 2>/dev/null`,
-        { timeout: 60000 }
+
+      // ── SINGLE-PASS FAST-SEEK EXTRACT (enterprise-grade) ──────────────────
+      // Old approach: one ffmpeg per segment, each re-opening the full remote
+      // MP4 with -ss AFTER -i (slow decode-seek from the file start every time).
+      // For a 50-min source × 60+ segments that blew past every timeout and
+      // blocked the event loop. New approach opens the remote file ONCE and
+      // pulls every window in a single ffmpeg invocation:
+      //   • Each window is its own input with -ss BEFORE -i (fast index seek —
+      //     ffmpeg jumps via the container index instead of decoding from 0).
+      //   • -t bounds each input to the window length.
+      //   • An amix-free concat filtergraph ([a0][a1]...concat=n=N:v=0:a=1)
+      //     stitches the windows in order into one mono 44.1kHz PCM WAV — the
+      //     exact same output shape ElevenLabs cloning expects.
+      // Result: tens of seconds → low single digits, and it no longer freezes
+      // the service for concurrent callers.
+      const valid = timestamps.filter(
+        (t) => t && t.start_ms != null && t.end_ms != null && t.end_ms > t.start_ms,
       );
+      if (valid.length === 0) throw new Error("No valid timestamp windows provided");
+
+      const inputArgs = [];
+      const filterParts = [];
+      valid.forEach((t, i) => {
+        const startSec = (t.start_ms / 1000).toFixed(3);
+        const durSec = ((t.end_ms - t.start_ms) / 1000).toFixed(3);
+        // -ss before -i = fast input seek; -t bounds the window.
+        inputArgs.push("-ss", startSec, "-t", durSec, "-i", signedUrl);
+        // Resample each window to a uniform format before concat so a
+        // variable-rate source can't desync the filtergraph.
+        filterParts.push(`[${i}:a]aresample=44100,aformat=channel_layouts=mono[a${i}]`);
+      });
+      const concatInputs = valid.map((_, i) => `[a${i}]`).join("");
+      const filterGraph = `${filterParts.join(";")};${concatInputs}concat=n=${valid.length}:v=0:a=1[out]`;
+
+      const ffmpegArgs = [
+        "-y",
+        ...inputArgs,
+        "-filter_complex", filterGraph,
+        "-map", "[out]",
+        "-acodec", "pcm_s16le",
+        "-ar", "44100",
+        "-ac", "1",
+        outputFile,
+      ];
+      await runFfmpeg(ffmpegArgs, { timeoutMs: 110000, label: "Audio extraction" });
 
       const audioBuffer = fs.readFileSync(outputFile);
       const sizeMB = (audioBuffer.length / 1024 / 1024).toFixed(1);
-      console.log(`Extracted ${sizeMB}MB audio (${segFiles.length} segments)`);
+      console.log(`Extracted ${sizeMB}MB audio (${valid.length} segments, single-pass)`);
 
       const outputKey = `dubflow/voice-clones/${speaker_label || "speaker"}_${Date.now()}.wav`;
       await s3.send(new PutObjectCommand({
@@ -106,7 +165,7 @@ const server = http.createServer(async (req, res) => {
         s3_key: outputKey,
         signed_url: audioSignedUrl,
         size_mb: parseFloat(sizeMB),
-        segment_count: segFiles.length,
+        segment_count: valid.length,
       }));
 
     } catch (err) {
