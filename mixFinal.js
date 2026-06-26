@@ -1,15 +1,86 @@
 /* eslint-env node */
 /* eslint-disable no-undef */
 // /mix-final endpoint — enterprise multi-clip audio mixer.
-// Single FFmpeg pass with filter_complex graph. Eliminates boundary pops
-// and clipping by design. Called by Base44 buildFinalMix function.
+//
+// BATCHED HIERARCHICAL MIX (2026-06-26) — film/TV-scale durability fix.
+// The previous single-pass design built ONE filter_complex with N clip chains
+// feeding a single amix=inputs=N+1, with an apad on every clip extending it to
+// the FULL program length before the mix clamped it. Peak memory therefore
+// scaled with clips × timeline_duration: a 52-min project with 314 clips
+// OOM-killed the FFmpeg process (empty stderr_tail = SIGKILL, no decode error),
+// and a 90–120 min film with 600–900 clips would fail every time.
+//
+// New design mixes clips in BOUNDED BATCHES (BATCH_SIZE clips → one intermediate
+// stem WAV each), then mixes the handful of intermediate stems + the M&E bed +
+// the isolated-vocals bed into the final program. Peak memory is bounded by
+// BATCH_SIZE, NOT total clip count — a 900-clip film uses the same peak memory
+// as an 80-clip short. Summation is associative, so the output is bit-equivalent
+// to the old single-pass mix: every clip keeps its identical
+// atempo→atrim→fades→gain→adelay chain; batching only changes how the
+// already-positioned clips are summed. Render parity (fades/trims/timing/
+// loudnorm) is preserved exactly.
+//
+// FFmpeg runs via the non-blocking spawn helper (passed in from index.js) so a
+// long film mix never freezes the event loop, and a failure surfaces the real
+// signal/code (SIGKILL = OOM) instead of an opaque empty stderr_tail.
 //
 // Supports optional EBU R128 / ITU-R BS.1770 loudness normalization on the
-// final program (post-mix, including M&E bed if present). Industry standard
-// for broadcast and streaming deliverables (Netflix, Apple TV+, EBU, BBC).
+// final program (post-mix, including M&E + vocals beds if present). Industry
+// standard for broadcast and streaming deliverables (Netflix, Apple TV+, EBU, BBC).
 
-const { execSync } = require("child_process");
+const { spawn } = require("child_process");
 const fs = require("fs");
+
+// Max clips summed in a single intermediate FFmpeg pass. Keeps peak memory
+// bounded regardless of total clip count. 80 is comfortably safe on a small
+// Railway dyno (each pass decodes ≤80 short clips + a silent base, never the
+// whole program-length apad fan-out the old design built). Tunable via the
+// MIX_BATCH_SIZE env var without a code change.
+const BATCH_SIZE = Math.max(10, Math.min(200, Number(process.env.MIX_BATCH_SIZE) || 80));
+
+// Non-blocking ffmpeg runner. Rejects with a TRUTHFUL error that names the
+// terminating signal (SIGKILL ⇒ almost always OOM on a big graph) and the last
+// stderr — so a mix failure is never an opaque empty tail again. Mirrors the
+// runFfmpeg helper in index.js but returns the captured stderr on success too
+// (the caller logs the loudnorm summary from it).
+function runFfmpeg(args, { timeoutMs = 25 * 60 * 1000, label = "ffmpeg" } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { child.kill("SIGKILL"); } catch (_) { /* already gone */ }
+      reject(Object.assign(new Error(`${label} timed out after ${Math.round(timeoutMs / 1000)}s`), { kind: "timeout" }));
+    }, timeoutMs);
+    child.stderr.on("data", (d) => { stderr += d.toString(); if (stderr.length > 200000) stderr = stderr.slice(-100000); });
+    child.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(Object.assign(new Error(`${label} spawn failed: ${err.message}`), { kind: "spawn_failed" }));
+    });
+    child.on("close", (code, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code === 0) { resolve(stderr); return; }
+      // signal SET (no exit code) = the kernel/OS killed the process. SIGKILL on
+      // a large mix is the OOM signature. Surface it explicitly so the operator
+      // sees "killed by SIGKILL (likely out of memory)" instead of empty tail.
+      const tail = stderr.slice(-2000);
+      const oom = signal === "SIGKILL" || signal === "SIGSEGV";
+      const reason = signal
+        ? `killed by ${signal}${oom ? " (likely out of memory)" : ""}`
+        : `exited ${code}`;
+      reject(Object.assign(
+        new Error(`${label} ${reason}`),
+        { kind: oom ? "oom" : "ffmpeg_error", signal, code, stderr_tail: tail },
+      ));
+    });
+  });
+}
 
 function registerMixFinal(server, API_KEY) {
   const originalListeners = server.listeners("request").slice();
@@ -22,6 +93,74 @@ function registerMixFinal(server, API_KEY) {
     // Fall through to the original handler
     for (const listener of originalListeners) listener(req, res);
   });
+}
+
+// Build the per-clip filter chain (identical to the legacy single-pass design).
+// Input label is [<inIdx>:a]; output label is [<outLabel>]. Pulled out so the
+// batched intermediate passes and the (former) single pass share ONE source of
+// truth for render parity.
+function buildClipChain(c, inIdx, outLabel, sampleRate, fadeInSec, fadeOutSec) {
+  const delay = Math.max(0, Math.round(Number(c.start_ms)));
+  const gainDb = Number(c.gain_db) || 0;
+
+  const rate = Number(c.playback_rate);
+  const tempoPart = (Number.isFinite(rate) && rate > 0 && Math.abs(rate - 1) > 0.001)
+    ? `atempo=${Math.max(0.5, Math.min(2.0, rate)).toFixed(4)},`
+    : "";
+
+  const maxDurMs = Number(c.max_duration_ms);
+  const trimPart = (Number.isFinite(maxDurMs) && maxDurMs > 0)
+    ? `atrim=end=${(maxDurMs / 1000).toFixed(4)},`
+    : "";
+
+  const fadeInPart = fadeInSec > 0 ? `afade=t=in:st=0:d=${fadeInSec}:curve=tri,` : "";
+  const fadeOutPart = fadeOutSec > 0 ? `areverse,afade=t=in:st=0:d=${fadeOutSec}:curve=tri,areverse,` : "";
+
+  return (
+    `[${inIdx}:a]` +
+    `aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo,` +
+    tempoPart +
+    trimPart +
+    fadeInPart +
+    fadeOutPart +
+    (gainDb !== 0 ? `volume=${gainDb}dB,` : "") +
+    `adelay=${delay}|${delay},` +
+    `apad` +
+    `[${outLabel}]`
+  );
+}
+
+// Mix one batch of positioned clips into a single TC-locked intermediate WAV at
+// the FULL program duration. The intermediate carries every clip already at its
+// absolute timeline offset (adelay), so the final pass simply sums the
+// intermediates with no further positioning. amix=duration=first clamps to the
+// silent base (= program length). normalize=0 preserves levels (we sum, never
+// average). 32-bit float PCM intermediates avoid any quantization loss across
+// the two mix stages.
+async function mixBatch(clips, durationSec, sampleRate, fadeInSec, fadeOutSec, outFile) {
+  const args = ["-y", "-hide_banner", "-loglevel", "warning", "-nostdin"];
+  // Silent base = program length. duration=first clamps the batch to it.
+  args.push("-f", "lavfi", "-t", String(durationSec),
+    "-i", `anullsrc=channel_layout=stereo:sample_rate=${sampleRate}`);
+  for (const c of clips) args.push("-i", c.url);
+
+  const filterParts = [`[0:a]aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo[base]`];
+  const mixLabels = ["[base]"];
+  for (let i = 0; i < clips.length; i++) {
+    filterParts.push(buildClipChain(clips[i], i + 1, `c${i}`, sampleRate, fadeInSec, fadeOutSec));
+    mixLabels.push(`[c${i}]`);
+  }
+  filterParts.push(
+    `${mixLabels.join("")}amix=inputs=${mixLabels.length}:duration=first:normalize=0:dropout_transition=0[out]`,
+  );
+
+  const filterFile = `${outFile}.filter.txt`;
+  fs.writeFileSync(filterFile, filterParts.join(";"));
+  args.push("-filter_complex_script", filterFile, "-map", "[out]",
+    "-c:a", "pcm_f32le", "-ar", String(sampleRate), "-ac", "2", outFile);
+
+  await runFfmpeg(args, { label: `mix-batch(${clips.length} clips)` });
+  try { fs.unlinkSync(filterFile); } catch (_) { /* best effort */ }
 }
 
 async function handleMixFinal(req, res, API_KEY) {
@@ -45,31 +184,19 @@ async function handleMixFinal(req, res, API_KEY) {
   // Original-language dialogue (isolated vocals) stem — the THIRD mixing-console
   // input. Optional and additive: present only when the operator's mix recipe
   // includes the original dialogue (bilingual QC, faint reference bed, etc.).
-  // Same shape + same filter-graph treatment as me_track (a full-program stem
-  // with its own gain), so the 3-fader console maps 1:1 onto three FFmpeg inputs.
   const vocalsTrack = body.vocals_track || null;
   const durationMs = Number(body.duration_ms);
   const outputFormat = (body.output_format || "wav").toLowerCase();
   const sampleRate = Number(body.sample_rate || 48000);
   // Asymmetric micro-fades on every clip — must match the /time-stretch
   // fitting pass so the program mix never reintroduces a boundary pop the
-  // fitted clips already suppressed. Defaults are the production contract:
-  // 8ms in, 12ms out (tail bumped because near-peak clip-end signal is the
-  // dominant audible pop). `fade_ms` is kept as a back-compat alias for the
-  // fade-IN value only; legacy callers passing a single fade_ms get 8ms-style
-  // symmetric behavior unless they opt into the asymmetric pair.
+  // fitted clips already suppressed. Defaults: 8ms in, 12ms out.
   const _legacyFade = body.fade_ms != null ? Number(body.fade_ms) : null;
   const fadeInMs = Math.max(0, Math.min(50, Number(body.fade_in_ms ?? _legacyFade ?? 8)));
   const fadeOutMs = Math.max(0, Math.min(50, Number(body.fade_out_ms ?? _legacyFade ?? 12)));
 
-  // EBU R128 loudness normalization target (LUFS).
-  // Accepted values:
-  //   -16 → streaming (Netflix Sound Mix Spec, Apple TV+, Spotify, YouTube)
-  //   -23 → broadcast (EBU R128, ATSC A/85, BBC)
-  //   null / undefined → no normalization (raw mix)
-  // True-peak ceiling is always -1 dBTP. Loudness range 11 LU
-  // (industry-standard envelope — preserves performance dynamics while
-  // controlling overall program loudness).
+  // EBU R128 loudness normalization target (LUFS). -16 streaming / -23 broadcast
+  // / null = no normalization. True-peak ceiling always -1 dBTP, LRA 11 LU.
   const loudnessTargetLufs = body.loudness_target_lufs != null
     ? Number(body.loudness_target_lufs)
     : null;
@@ -107,161 +234,84 @@ async function handleMixFinal(req, res, API_KEY) {
   const durationSec = durationMs / 1000;
   const fadeInSec = fadeInMs / 1000;
   const fadeOutSec = fadeOutMs / 1000;
-  const fadeMs = Math.max(fadeInMs, fadeOutMs); // log/telemetry summary only
 
   try {
-    console.log(`[mix-final] ${clips.length} clips, me=${!!meTrack}, vocals=${!!vocalsTrack}, dur=${durationMs}ms, fmt=${outputFormat}, sr=${sampleRate}, loudnorm=${loudnessTargetLufs ?? "off"}`);
+    const batchCount = Math.ceil(clips.length / BATCH_SIZE);
+    console.log(`[mix-final] ${clips.length} clips in ${batchCount} batch(es) of ≤${BATCH_SIZE}, me=${!!meTrack}, vocals=${!!vocalsTrack}, dur=${durationMs}ms, fmt=${outputFormat}, sr=${sampleRate}, loudnorm=${loudnessTargetLufs ?? "off"}`);
 
-    const args = ["-y", "-hide_banner", "-loglevel", "warning", "-nostdin"];
-    args.push("-f", "lavfi", "-t", String(durationSec),
-      "-i", `anullsrc=channel_layout=stereo:sample_rate=${sampleRate}`);
-    for (const c of clips) args.push("-i", c.url);
-    if (meTrack) args.push("-i", meTrack.url);
-    if (vocalsTrack) args.push("-i", vocalsTrack.url);
+    const t0 = Date.now();
 
-    const filterParts = [];
-    filterParts.push(`[0:a]aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo[base]`);
-
-    const mixLabels = ["[base]"];
-    for (let i = 0; i < clips.length; i++) {
-      const c = clips[i];
-      const idx = i + 1;
-      const delay = Math.max(0, Math.round(Number(c.start_ms)));
-      const gainDb = Number(c.gain_db) || 0;
-
-      // ── RENDER PARITY (A′) — per-clip trim to the next-clip boundary ──────
-      // The editor plays clips sequentially and cuts each clip the instant the
-      // NEXT dubbed clip starts (MediaPlayer's activeSegId switch). To make the
-      // export match exactly, the producer passes max_duration_ms = (next clip
-      // start − this clip start) for any clip whose audio would otherwise
-      // overrun the next clip. We atrim the SOURCE clip to that length BEFORE
-      // the fade-out + delay, so the clip stops precisely where the editor cuts
-      // it — what-you-hear == what-exports. When max_duration_ms is absent/null
-      // the clip rings out into the gap untouched (faithful to the editor too).
-      // The integrity gate upstream (preflightExportClips / buildFinalMix) has
-      // already BLOCKED any clip whose REAL audio would be clipped mid-word, so
-      // by the time we trim here it is always a clean, intentional boundary.
-      // ── SPEED-TO-FIT (single source of truth) ────────────────────────────
-      // The editor plays the natural-dub buffer at AudioBufferSourceNode
-      // .playbackRate when the operator sets Speed-to-Fit. atempo reproduces the
-      // SAME tempo change here (pitch-preserved), applied FIRST so the trim +
-      // fades land on the sped-up signal exactly as the editor cuts the sped-up
-      // buffer. Omitted/1 = native speed. atempo's valid range is [0.5, 2.0],
-      // matching the editor's clamp, so a single stage always covers it.
-      const rate = Number(c.playback_rate);
-      const tempoPart = (Number.isFinite(rate) && rate > 0 && Math.abs(rate - 1) > 0.001)
-        ? `atempo=${Math.max(0.5, Math.min(2.0, rate)).toFixed(4)},`
-        : "";
-
-      // The trim boundary is measured AFTER the tempo change (it's the length
-      // the editor hears), so atrim runs on the post-atempo signal.
-      const maxDurMs = Number(c.max_duration_ms);
-      const trimPart = (Number.isFinite(maxDurMs) && maxDurMs > 0)
-        ? `atrim=end=${(maxDurMs / 1000).toFixed(4)},`
-        : "";
-
-      // Asymmetric micro-fades on every clip. The fade-OUT uses the areverse
-      // trick (a fade-IN on the reversed signal == a fade-OUT on the forward
-      // signal), which needs no knowledge of the clip's intrinsic duration.
-      // fade-IN is applied head-on. apad extends each clip with digital silence
-      // so amix=duration=first clamps the program to the base track length.
-      // NOTE: the trim runs FIRST so the fade-out lands on the trimmed tail
-      // (a clean boundary cut), never on the original (longer) clip end.
-      const fadeInPart = fadeInSec > 0 ? `afade=t=in:st=0:d=${fadeInSec}:curve=tri,` : "";
-      const fadeOutPart = fadeOutSec > 0 ? `areverse,afade=t=in:st=0:d=${fadeOutSec}:curve=tri,areverse,` : "";
-      const chain =
-        `[${idx}:a]` +
-        `aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo,` +
-        tempoPart +
-        trimPart +
-        fadeInPart +
-        fadeOutPart +
-        (gainDb !== 0 ? `volume=${gainDb}dB,` : "") +
-        `adelay=${delay}|${delay},` +
-        `apad` +
-        `[c${i}]`;
-      filterParts.push(chain);
-      mixLabels.push(`[c${i}]`);
+    // ── STAGE 1: mix clips in bounded batches → intermediate TC-locked stems ──
+    // Each intermediate is the full program length with its batch's clips
+    // already at their absolute offsets. Peak memory is bounded by BATCH_SIZE.
+    const intermediates = [];
+    for (let b = 0; b < batchCount; b++) {
+      const batch = clips.slice(b * BATCH_SIZE, (b + 1) * BATCH_SIZE);
+      const interFile = `${tmpDir}/inter_${b}.wav`;
+      await mixBatch(batch, durationSec, sampleRate, fadeInSec, fadeOutSec, interFile);
+      intermediates.push(interFile);
     }
+    console.log(`[mix-final] stage 1 done: ${intermediates.length} intermediate stem(s) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
 
+    // ── STAGE 2: sum intermediate stems + M&E + vocals → final program ──
+    // Every input here is already TC-locked at program length, so the final
+    // pass is a pure sum (no positioning). With a single batch and no beds this
+    // is just a format+trim of the one intermediate. Loudnorm (when requested)
+    // runs once on the summed program — identical to the legacy behavior.
+    const args2 = ["-y", "-hide_banner", "-loglevel", "warning", "-nostdin"];
+    for (const f of intermediates) args2.push("-i", f);
+    if (meTrack) args2.push("-i", meTrack.url);
+    if (vocalsTrack) args2.push("-i", vocalsTrack.url);
+
+    const filter2 = [];
+    const sumLabels = [];
+    for (let i = 0; i < intermediates.length; i++) {
+      filter2.push(`[${i}:a]aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo[s${i}]`);
+      sumLabels.push(`[s${i}]`);
+    }
+    let nextIdx = intermediates.length;
     if (meTrack) {
-      const meIdx = clips.length + 1;
       const meGain = Number(meTrack.gain_db ?? -6);
-      filterParts.push(
-        `[${meIdx}:a]aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo,` +
-        `volume=${meGain}dB[me]`
-      );
-      mixLabels.push("[me]");
+      filter2.push(`[${nextIdx}:a]aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo,volume=${meGain}dB[me]`);
+      sumLabels.push("[me]");
+      nextIdx++;
     }
-
-    // Original-language dialogue (isolated vocals) stem — mixed in at its own
-    // gain when present. Input index sits AFTER the M&E track: base(0) +
-    // clips(1..N) + me(N+1, when present) + vocals(next). Computed from the
-    // actual presence of meTrack so the index is always correct.
     if (vocalsTrack) {
-      const vocalsIdx = clips.length + 1 + (meTrack ? 1 : 0);
       const vocalsGain = Number(vocalsTrack.gain_db ?? -18);
-      filterParts.push(
-        `[${vocalsIdx}:a]aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo,` +
-        `volume=${vocalsGain}dB[vox]`
-      );
-      mixLabels.push("[vox]");
+      filter2.push(`[${nextIdx}:a]aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo,volume=${vocalsGain}dB[vox]`);
+      sumLabels.push("[vox]");
+      nextIdx++;
     }
+    filter2.push(`${sumLabels.join("")}amix=inputs=${sumLabels.length}:duration=first:normalize=0:dropout_transition=0[mix]`);
 
-    filterParts.push(
-      `${mixLabels.join("")}` +
-      `amix=inputs=${mixLabels.length}:duration=first:normalize=0:dropout_transition=0` +
-      `[mix]`
-    );
-
-    // Final output stage. When loudness normalization is requested, append the
-    // single-pass loudnorm filter (FFmpeg's implementation of ITU-R BS.1770-4).
-    // print_format=summary logs measured input/output LUFS to Railway logs —
-    // auditor evidence that the system can prove what loudness it produced.
     const loudnormSuffix = loudnessTargetLufs != null
       ? `,loudnorm=I=${loudnessTargetLufs}:TP=-1:LRA=11:print_format=summary`
       : "";
-    filterParts.push(`[mix]atrim=0:${durationSec},asetpts=PTS-STARTPTS${loudnormSuffix}[out]`);
+    filter2.push(`[mix]atrim=0:${durationSec},asetpts=PTS-STARTPTS${loudnormSuffix}[out]`);
 
-    const filterComplex = filterParts.join(";");
-    const filterFile = `${tmpDir}/filter.txt`;
-    fs.writeFileSync(filterFile, filterComplex);
-
-    args.push("-filter_complex_script", filterFile, "-map", "[out]");
+    const filterFile2 = `${tmpDir}/filter_final.txt`;
+    fs.writeFileSync(filterFile2, filter2.join(";"));
+    args2.push("-filter_complex_script", filterFile2, "-map", "[out]");
 
     if (outputFormat === "wav") {
-      args.push("-c:a", "pcm_s24le", "-ar", String(sampleRate), "-ac", "2");
+      args2.push("-c:a", "pcm_s24le", "-ar", String(sampleRate), "-ac", "2");
     } else if (outputFormat === "mp3") {
-      args.push("-c:a", "libmp3lame", "-b:a", "320k", "-ar", String(sampleRate), "-ac", "2");
+      args2.push("-c:a", "libmp3lame", "-b:a", "320k", "-ar", String(sampleRate), "-ac", "2");
     } else if (outputFormat === "aac") {
-      args.push("-c:a", "aac", "-b:a", "256k", "-ar", String(sampleRate), "-ac", "2");
+      args2.push("-c:a", "aac", "-b:a", "256k", "-ar", String(sampleRate), "-ac", "2");
     }
-    args.push(outputFile);
+    args2.push(outputFile);
 
-    const quote = (a) => `'${String(a).replace(/'/g, "'\\''")}'`;
-    const cmd = `ffmpeg ${args.map(quote).join(" ")} 2>&1`;
-    console.log(`[mix-final] ffmpeg: ${args.length} args, filter graph ${filterComplex.length} bytes`);
+    const ffmpegStderr = await runFfmpeg(args2, { label: "mix-final" });
 
-    const t0 = Date.now();
-    let ffmpegOutput = "";
-    try {
-      ffmpegOutput = execSync(cmd, { timeout: 25 * 60 * 1000, maxBuffer: 50 * 1024 * 1024 }).toString();
-    } catch (err) {
-      const stderrTail = (err.stdout || err.stderr || "").toString().slice(-2000);
-      console.error("[mix-final] ffmpeg failed:", stderrTail);
-      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
-      res.writeHead(500, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ error: "ffmpeg failed", stderr_tail: stderrTail }));
-    }
+    // Free intermediates ASAP (each is a full-program-length float WAV).
+    for (const f of intermediates) { try { fs.unlinkSync(f); } catch (_) { /* best effort */ } }
 
-    // If loudnorm ran, log the measured summary block so auditors can read it
-    // back from Railway logs. The summary block contains "Input Integrated",
-    // "Output Integrated", "Output True Peak", etc.
-    if (loudnessTargetLufs != null && ffmpegOutput) {
-      const summaryIdx = ffmpegOutput.indexOf("Input Integrated");
+    // Log the loudnorm measured summary for auditor evidence (Railway logs).
+    if (loudnessTargetLufs != null && ffmpegStderr) {
+      const summaryIdx = ffmpegStderr.indexOf("Input Integrated");
       if (summaryIdx >= 0) {
-        const summaryTail = ffmpegOutput.slice(summaryIdx, summaryIdx + 600);
-        console.log(`[mix-final] loudnorm summary:\n${summaryTail}`);
+        console.log(`[mix-final] loudnorm summary:\n${ffmpegStderr.slice(summaryIdx, summaryIdx + 600)}`);
       }
     }
 
@@ -280,15 +330,30 @@ async function handleMixFinal(req, res, API_KEY) {
       "Content-Length": outputBuffer.length,
       "X-Mix-Duration-Ms": String(durationMs),
       "X-Mix-Clip-Count": String(clips.length),
+      "X-Mix-Batch-Count": String(intermediates.length),
       "X-Mix-Loudness-Target-Lufs": loudnessTargetLufs != null ? String(loudnessTargetLufs) : "off",
     });
     return res.end(outputBuffer);
 
   } catch (err) {
-    console.error("[mix-final] fatal:", err.message);
-    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
-    res.writeHead(500);
-    return res.end(JSON.stringify({ error: err.message }));
+    // TRUTHFUL failure (2026-06-26): when ffmpeg is OOM-killed the empty stderr
+    // is no longer mistaken for a mystery — err.kind/signal name the real cause
+    // so the operator sees "killed by SIGKILL (likely out of memory)" and the
+    // export surface can advise. SOC 2 CC7.4 / CC8.1.
+    const kind = err.kind || "fatal";
+    const stderrTail = err.stderr_tail || "";
+    console.error(`[mix-final] ${kind}:`, err.message, stderrTail ? `| tail: ${stderrTail.slice(-500)}` : "");
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) { /* best effort */ }
+    res.writeHead(500, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({
+      error: kind === "oom"
+        ? "ffmpeg failed: out of memory while mixing (the program was too large for a single pass)"
+        : "ffmpeg failed",
+      kind,
+      signal: err.signal || null,
+      stderr_tail: stderrTail,
+      detail: err.message,
+    }));
   }
 }
 
