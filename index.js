@@ -62,7 +62,7 @@ const API_KEY = process.env.API_KEY || "change-me";
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. Current build carries the universal micro-fade bake in
 // /time-stretch (8ms in / 12ms out, post-atempo, tri curves).
-const BUILD_TAG = "extractor-2026-06-26-batched-mix-final";
+const BUILD_TAG = "extractor-2026-07-07-lossless-pipeline";
 
 const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/health") {
@@ -189,7 +189,10 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ error: "Unauthorized" }));
     }
 
-    const { audio_url, target_duration_sec } = body;
+    // output_format: "mp3" (legacy default, back-compat for old callers) or
+    // "wav" (lossless pipeline — pcm_s16le, no generational re-encode loss).
+    const { audio_url, target_duration_sec, output_format = "mp3" } = body;
+    const tsOutFmt = output_format === "wav" ? "wav" : "mp3";
     if (!audio_url || !target_duration_sec) {
       res.writeHead(400);
       return res.end(JSON.stringify({ error: "audio_url and target_duration_sec required" }));
@@ -211,8 +214,11 @@ const server = http.createServer(async (req, res) => {
 
     const tmpDir = `/tmp/stretch_${Date.now()}`;
     fs.mkdirSync(tmpDir, { recursive: true });
-    const inputFile = `${tmpDir}/input.mp3`;
-    const outputFile = `${tmpDir}/output.mp3`;
+    // Extension-less input — ffmpeg content-probes the real container (the
+    // lossless pipeline sends WAV; legacy clips are MP3). Never let a wrong
+    // extension steer the demuxer.
+    const inputFile = `${tmpDir}/input`;
+    const outputFile = `${tmpDir}/output.${tsOutFmt}`;
 
     try {
       console.log(`Time-stretching audio to ${target_duration_sec}s`);
@@ -263,8 +269,10 @@ const server = http.createServer(async (req, res) => {
 
       console.log(`FFmpeg filter: ${filterStr}`);
 
+      // Lossless path encodes pcm_s16le WAV; legacy path keeps lame MP3.
+      const tsCodecArgs = tsOutFmt === "wav" ? "-c:a pcm_s16le" : "-c:a libmp3lame -q:a 2";
       execSync(
-        `ffmpeg -y -i "${inputFile}" -filter:a "${filterStr}" -vn "${outputFile}" 2>/dev/null`,
+        `ffmpeg -y -i "${inputFile}" -filter:a "${filterStr}" -vn ${tsCodecArgs} "${outputFile}" 2>/dev/null`,
         { timeout: 30000 }
       );
 
@@ -298,7 +306,7 @@ const server = http.createServer(async (req, res) => {
 
       fs.rmSync(tmpDir, { recursive: true, force: true });
 
-      res.writeHead(200, { "Content-Type": "audio/mpeg", ...durationHeaders });
+      res.writeHead(200, { "Content-Type": tsOutFmt === "wav" ? "audio/wav" : "audio/mpeg", ...durationHeaders });
       res.end(stretchedBuffer);
 
     } catch (err) {
@@ -376,8 +384,10 @@ const server = http.createServer(async (req, res) => {
       const inputFlagsStr = inputFlags.length > 0 ? inputFlags.join(" ") + " " : "";
       const outputFlagsStr = outputFlags.length > 0 ? " " + outputFlags.join(" ") : "";
 
-      // Build FFmpeg command
-      const cmd = `ffmpeg -y ${inputFlagsStr}-i "${inputFile}" -af "${filters}"${outputFlagsStr} -c:a libmp3lame -q:a 2 "${outputFile}" 2>/dev/null`;
+      // Build FFmpeg command — codec follows the requested output_format:
+      // wav → pcm_s16le (lossless identity-shift path), else lame MP3.
+      const procCodecArgs = output_format === "wav" ? "-c:a pcm_s16le" : "-c:a libmp3lame -q:a 2";
+      const cmd = `ffmpeg -y ${inputFlagsStr}-i "${inputFile}" -af "${filters}"${outputFlagsStr} ${procCodecArgs} "${outputFile}" 2>/dev/null`;
       console.log(`[process] Running: ${cmd}`);
       execSync(cmd, { timeout: 120000 });
 
