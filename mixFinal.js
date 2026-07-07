@@ -209,7 +209,7 @@ async function handleMixFinal(req, res, API_KEY) {
   if (clips.length > MAX_CLIPS) { res.writeHead(400); return res.end(JSON.stringify({ error: `too many clips (max ${MAX_CLIPS})` })); }
   if (!Number.isFinite(durationMs) || durationMs <= 0) { res.writeHead(400); return res.end(JSON.stringify({ error: "duration_ms required and must be > 0" })); }
   if (durationMs > MAX_DURATION_MS) { res.writeHead(400); return res.end(JSON.stringify({ error: `duration_ms exceeds max (${MAX_DURATION_MS})` })); }
-  if (!["wav", "mp3", "aac"].includes(outputFormat)) { res.writeHead(400); return res.end(JSON.stringify({ error: "output_format must be wav, mp3, or aac" })); }
+  if (!["wav", "flac", "mp3", "aac"].includes(outputFormat)) { res.writeHead(400); return res.end(JSON.stringify({ error: "output_format must be wav, flac, mp3, or aac" })); }
   if (![44100, 48000].includes(sampleRate)) { res.writeHead(400); return res.end(JSON.stringify({ error: "sample_rate must be 44100 or 48000" })); }
 
   for (let i = 0; i < clips.length; i++) {
@@ -295,6 +295,9 @@ async function handleMixFinal(req, res, API_KEY) {
 
     if (outputFormat === "wav") {
       args2.push("-c:a", "pcm_s24le", "-ar", String(sampleRate), "-ac", "2");
+    } else if (outputFormat === "flac") {
+      // Lossless compressed deliverable — 24-bit FLAC (s32 input → 24 bps).
+      args2.push("-c:a", "flac", "-sample_fmt", "s32", "-ar", String(sampleRate), "-ac", "2");
     } else if (outputFormat === "mp3") {
       args2.push("-c:a", "libmp3lame", "-b:a", "320k", "-ar", String(sampleRate), "-ac", "2");
     } else if (outputFormat === "aac") {
@@ -323,6 +326,7 @@ async function handleMixFinal(req, res, API_KEY) {
     fs.rmSync(tmpDir, { recursive: true, force: true });
 
     const mime = outputFormat === "wav" ? "audio/wav"
+      : outputFormat === "flac" ? "audio/flac"
       : outputFormat === "mp3" ? "audio/mpeg"
       : "audio/aac";
     res.writeHead(200, {
