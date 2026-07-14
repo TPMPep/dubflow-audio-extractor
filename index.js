@@ -39,30 +39,28 @@ function runFfmpeg(args, { timeoutMs = 120000, label = "ffmpeg" } = {}) {
     });
   });
 }
-const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
-const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+// Zero-dependency WebCrypto SigV4 signer (replaces @aws-sdk/@smithy — incident
+// 2026-07-07/08). STS session-token aware. See ./s3-signer.js.
+const { presignS3Url, putS3Object, storageFromEnv, storageFromExplicit } = require("./s3-signer");
 const { registerMixFinal } = require("./mixFinal");
 const { registerMuxVideo } = require("./muxVideo");
 const { registerProxyGen } = require("./proxyGenerator");
 const { registerHlsIngest } = require("./hlsIngest");
 
-const s3 = new S3Client({
-  region: process.env.AWS_REGION || "us-west-2",
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-  },
-});
-
 const BUCKET = process.env.S3_BUCKET || "pep-test";
+const AWS_REGION = process.env.AWS_REGION || "us-west-2";
 const API_KEY = process.env.API_KEY || "change-me";
+
+// This service's own storage handle (self creds from env, STS-aware). Built
+// once — the resolved creds/region/bucket don't change per request.
+const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 
 // Build tag — bumped whenever this service changes so /health self-reports the
 // running build. Lets us verify a Railway redeploy actually landed (the same
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. Current build carries the universal micro-fade bake in
 // /time-stretch (8ms in / 12ms out, post-atempo, tri curves).
-const BUILD_TAG = "extractor-2026-07-07-lossless-pipeline";
+const BUILD_TAG = "extractor-2026-07-14-process-flac-codec";
 
 const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/health") {
@@ -90,8 +88,7 @@ const server = http.createServer(async (req, res) => {
     try {
       console.log(`Extracting audio for ${speaker_label || "speaker"} from ${s3_key}, ${timestamps.length} segments`);
 
-      const getCmd = new GetObjectCommand({ Bucket: BUCKET, Key: s3_key });
-      const signedUrl = await getSignedUrl(s3, getCmd, { expiresIn: 3600 });
+      const signedUrl = await presignS3Url({ method: "GET", storage, key: s3_key, expiresIn: 3600 });
 
       const tmpDir = `/tmp/${Date.now()}`;
       fs.mkdirSync(tmpDir, { recursive: true });
@@ -147,15 +144,9 @@ const server = http.createServer(async (req, res) => {
       console.log(`Extracted ${sizeMB}MB audio (${valid.length} segments, single-pass)`);
 
       const outputKey = `dubflow/voice-clones/${speaker_label || "speaker"}_${Date.now()}.wav`;
-      await s3.send(new PutObjectCommand({
-        Bucket: BUCKET,
-        Key: outputKey,
-        Body: audioBuffer,
-        ContentType: "audio/wav",
-      }));
+      await putS3Object(storage, outputKey, audioBuffer, { contentType: "audio/wav" });
 
-      const audioGetCmd = new GetObjectCommand({ Bucket: BUCKET, Key: outputKey });
-      const audioSignedUrl = await getSignedUrl(s3, audioGetCmd, { expiresIn: 3600 });
+      const audioSignedUrl = await presignS3Url({ method: "GET", storage, key: outputKey, expiresIn: 3600 });
 
       fs.rmSync(tmpDir, { recursive: true, force: true });
 
@@ -384,9 +375,21 @@ const server = http.createServer(async (req, res) => {
       const inputFlagsStr = inputFlags.length > 0 ? inputFlags.join(" ") + " " : "";
       const outputFlagsStr = outputFlags.length > 0 ? " " + outputFlags.join(" ") : "";
 
-      // Build FFmpeg command — codec follows the requested output_format:
-      // wav → pcm_s16le (lossless identity-shift path), else lame MP3.
-      const procCodecArgs = output_format === "wav" ? "-c:a pcm_s16le" : "-c:a libmp3lame -q:a 2";
+      // Build FFmpeg command — codec follows the requested output_format.
+      // The codec is chosen HERE by output_format, never smuggled in via
+      // extra_args (a caller-supplied "-c:a X" would collide with this append
+      // and produce a fatal duplicate "-c:a" — the M&E FLAC-extract bug). The
+      // extra_args parser above intentionally routes -acodec/-c:a into
+      // outputFlags, so any codec a caller passes there would double up; we own
+      // the codec exclusively via this switch.
+      //   wav  → pcm_s16le (lossless identity-shift path)
+      //   flac → native FLAC (lossless M&E High-fidelity source extract)
+      //   else → lame MP3 (default)
+      const procCodecArgs = output_format === "wav"
+        ? "-c:a pcm_s16le"
+        : output_format === "flac"
+          ? "-c:a flac"
+          : "-c:a libmp3lame -q:a 2";
       const cmd = `ffmpeg -y ${inputFlagsStr}-i "${inputFile}" -af "${filters}"${outputFlagsStr} ${procCodecArgs} "${outputFile}" 2>/dev/null`;
       console.log(`[process] Running: ${cmd}`);
       execSync(cmd, { timeout: 120000 });
@@ -641,6 +644,7 @@ const server = http.createServer(async (req, res) => {
       aws_region,
       aws_access_key_id,
       aws_secret_access_key,
+      aws_session_token,   // optional — present only for temporary STS creds
       ffmpeg_filter = "afftdn=nr=12,highpass=f=80,loudnorm=I=-16:TP=-1.5:LRA=11",
     } = body;
 
@@ -679,21 +683,17 @@ const server = http.createServer(async (req, res) => {
       console.log(`[normalize] Output: ${(outputBuffer.length / 1024).toFixed(0)}KB, ${durationSec.toFixed(2)}s`);
 
       // Upload to the caller's bucket using THEIR credentials (so writes stay
-      // within Base44's AWS account, not this service's).
-      const callerS3 = new S3Client({
-        region: aws_region || process.env.AWS_REGION || "us-west-2",
-        credentials: {
-          accessKeyId: aws_access_key_id,
-          secretAccessKey: aws_secret_access_key,
-        },
+      // within Base44's AWS account, not this service's). STS-aware: if the
+      // caller forwards a temporary session token it is signed alongside.
+      const callerStorage = storageFromExplicit({
+        region: aws_region || AWS_REGION,
+        bucket: target_bucket,
+        accessKeyId: aws_access_key_id,
+        secretAccessKey: aws_secret_access_key,
+        sessionToken: aws_session_token,
       });
 
-      await callerS3.send(new PutObjectCommand({
-        Bucket: target_bucket,
-        Key: target_key,
-        Body: outputBuffer,
-        ContentType: "audio/wav",
-      }));
+      await putS3Object(callerStorage, target_key, outputBuffer, { contentType: "audio/wav" });
 
       fs.rmSync(tmpDir, { recursive: true, force: true });
 
