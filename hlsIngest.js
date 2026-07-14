@@ -1,3 +1,5 @@
+/* eslint-env node */
+/* eslint-disable no-undef */
 // hlsIngest.js — Bit-faithful HLS-to-MP4 remux for the v2 ingest pipeline.
 //
 // Pattern matches proxyGenerator.js / mixFinal.js: exports a
@@ -33,15 +35,11 @@ const { execSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+// Zero-dependency WebCrypto SigV4 signer (replaces @aws-sdk/@smithy — incident
+// 2026-07-07/08). STS session-token aware. See ./s3-signer.js.
+const { putS3Object, storageFromEnv } = require("./s3-signer");
 
 const DEFAULT_INGEST_UA = "Mozilla/5.0 (compatible; DubFlowIngest/1.0; +https://dubflow.app/ingest)";
-
-function s3ClientForRegion(region, prefix) {
-  const accessKeyId = (prefix && process.env[`${prefix}_ACCESS_KEY_ID`]) || process.env.AWS_ACCESS_KEY_ID;
-  const secretAccessKey = (prefix && process.env[`${prefix}_SECRET_ACCESS_KEY`]) || process.env.AWS_SECRET_ACCESS_KEY;
-  return new S3Client({ region, credentials: { accessKeyId, secretAccessKey } });
-}
 
 // Build the ffmpeg command. Codec-conditional: AAC gets aac_adtstoasc,
 // AC-3 / E-AC-3 / unknown do NOT (the filter is AAC-only and will fail).
@@ -144,14 +142,9 @@ async function handleHlsIngest(req, res, API_KEY) {
     console.log(`[hls-ingest] ${hls_ingest_run_id} ffmpeg_complete duration_ms=${remuxDurationMs} size=${stat.size}`);
 
     // ─── Stream upload to S3 — same pattern as proxyGenerator.js ───
-    const s3 = s3ClientForRegion(region, credential_secret_prefix);
+    const storage = storageFromEnv({ region, bucket, prefix: credential_secret_prefix });
     const fileBuffer = fs.readFileSync(tmpFile);
-    await s3.send(new PutObjectCommand({
-      Bucket: bucket,
-      Key: output_key,
-      Body: fileBuffer,
-      ContentType: "video/mp4",
-    }));
+    await putS3Object(storage, output_key, fileBuffer, { contentType: "video/mp4" });
     console.log(`[hls-ingest] ${hls_ingest_run_id} s3_uploaded key=${output_key}`);
 
     fs.rmSync(tmpDir, { recursive: true, force: true });
