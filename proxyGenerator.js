@@ -1,3 +1,5 @@
+/* eslint-env node */
+/* eslint-disable no-undef */
 // proxyGenerator.js — v2 SYNCHRONOUS proxy generation (2026-05-14).
 //
 // Replaces the legacy fire-and-forget /generate-proxy + webhook callback
@@ -35,13 +37,9 @@ const { spawnSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
-
-function s3ClientForRegion(region, prefix) {
-  const accessKeyId = (prefix && process.env[`${prefix}_ACCESS_KEY_ID`]) || process.env.AWS_ACCESS_KEY_ID;
-  const secretAccessKey = (prefix && process.env[`${prefix}_SECRET_ACCESS_KEY`]) || process.env.AWS_SECRET_ACCESS_KEY;
-  return new S3Client({ region, credentials: { accessKeyId, secretAccessKey } });
-}
+// Zero-dependency WebCrypto SigV4 signer (replaces @aws-sdk/@smithy — incident
+// 2026-07-07/08). STS session-token aware. See ./s3-signer.js.
+const { putS3Object, storageFromEnv } = require("./s3-signer");
 
 async function handleProxyGenSync(req, res, API_KEY) {
   const t0 = Date.now();
@@ -158,17 +156,13 @@ async function handleProxyGenSync(req, res, API_KEY) {
       }));
     }
 
-    const s3 = s3ClientForRegion(region, credential_secret_prefix);
+    const storage = storageFromEnv({ region, bucket, prefix: credential_secret_prefix });
     const videoBuffer = fs.readFileSync(videoPath);
     const audioBuffer = fs.readFileSync(audioPath);
 
     await Promise.all([
-      s3.send(new PutObjectCommand({
-        Bucket: bucket, Key: proxy_video_key, Body: videoBuffer, ContentType: "video/mp4",
-      })),
-      s3.send(new PutObjectCommand({
-        Bucket: bucket, Key: proxy_audio_key, Body: audioBuffer, ContentType: "audio/flac",
-      })),
+      putS3Object(storage, proxy_video_key, videoBuffer, { contentType: "video/mp4" }),
+      putS3Object(storage, proxy_audio_key, audioBuffer, { contentType: "audio/flac" }),
     ]);
 
     const durationMs = Date.now() - t0;
