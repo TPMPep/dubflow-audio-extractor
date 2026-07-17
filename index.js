@@ -46,6 +46,7 @@ const { registerMixFinal } = require("./mixFinal");
 const { registerMuxVideo } = require("./muxVideo");
 const { registerProxyGen } = require("./proxyGenerator");
 const { registerHlsIngest } = require("./hlsIngest");
+const { registerHashFile } = require("./hashFile");
 
 const BUCKET = process.env.S3_BUCKET || "pep-test";
 const AWS_REGION = process.env.AWS_REGION || "us-west-2";
@@ -60,7 +61,7 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. Current build carries the universal micro-fade bake in
 // /time-stretch (8ms in / 12ms out, post-atempo, tri curves).
-const BUILD_TAG = "extractor-2026-07-14-process-flac-codec";
+const BUILD_TAG = "extractor-2026-07-17-hash-file-route";
 
 const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/health") {
@@ -779,4 +780,5 @@ registerMixFinal(server, API_KEY);
 registerMuxVideo(server, API_KEY);
 registerProxyGen(server, API_KEY);
 registerHlsIngest(server, API_KEY);
+registerHashFile(server, API_KEY);
 server.listen(3000, () => console.log("Audio extractor running on port 3000"));
