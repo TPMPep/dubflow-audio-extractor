@@ -56,18 +56,8 @@ function buildFfmpegCmd({ inputUrl, outputPath, audioCodec, userAgent }) {
   );
 }
 
-function registerHlsIngest(server, API_KEY) {
-  // Wrap existing request handler — same convention as proxyGenerator.js.
-  const previousListener = server.listeners("request")[0];
-  server.removeAllListeners("request");
-
-  server.on("request", async (req, res) => {
-    if (req.method === "POST" && req.url === "/hls-ingest") {
-      return handleHlsIngest(req, res, API_KEY);
-    }
-    if (previousListener) previousListener(req, res);
-  });
-}
+// Route descriptor — registered once in index.js's single route table.
+const routeHlsIngest = { method: "POST", path: "/hls-ingest", handler: handleHlsIngest };
 
 async function handleHlsIngest(req, res, API_KEY) {
   const chunks = [];
@@ -171,4 +161,4 @@ async function handleHlsIngest(req, res, API_KEY) {
   }
 }
 
-module.exports = { registerHlsIngest };
+module.exports = { routeHlsIngest };
