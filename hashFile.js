@@ -138,17 +138,7 @@ async function handleHashFile(req, res, API_KEY) {
   }
 }
 
-function registerHashFile(server, API_KEY) {
-  // Wrap existing request handler — same convention as proxyGenerator / hlsIngest.
-  const previousListener = server.listeners("request")[0];
-  server.removeAllListeners("request");
+// Route descriptor — registered once in index.js's single route table.
+const routeHashFile = { method: "POST", path: "/hash-file", handler: handleHashFile };
 
-  server.on("request", async (req, res) => {
-    if (req.method === "POST" && req.url === "/hash-file") {
-      return handleHashFile(req, res, API_KEY);
-    }
-    if (previousListener) previousListener(req, res);
-  });
-}
-
-module.exports = { registerHashFile };
+module.exports = { routeHashFile };
