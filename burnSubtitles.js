@@ -39,17 +39,9 @@
 const { execSync } = require("child_process");
 const fs = require("fs");
 
-function registerBurnSubtitles(server, API_KEY) {
-  const originalListeners = server.listeners("request").slice();
-  server.removeAllListeners("request");
-
-  server.on("request", async (req, res) => {
-    if (req.method === "POST" && req.url === "/burn-subtitles") {
-      return handleBurnSubtitles(req, res, API_KEY);
-    }
-    for (const listener of originalListeners) listener(req, res);
-  });
-}
+// Route descriptor — registered once in index.js's single route table. No
+// listener swapping (the old removeAllListeners chain raced 404s under load).
+const routeBurnSubtitles = { method: "POST", path: "/burn-subtitles", handler: handleBurnSubtitles };
 
 async function handleBurnSubtitles(req, res, API_KEY) {
   const chunks = [];
@@ -180,4 +172,4 @@ async function handleBurnSubtitles(req, res, API_KEY) {
   }
 }
 
-module.exports = { registerBurnSubtitles };
+module.exports = { routeBurnSubtitles };
