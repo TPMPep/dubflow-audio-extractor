@@ -82,18 +82,8 @@ function runFfmpeg(args, { timeoutMs = 25 * 60 * 1000, label = "ffmpeg" } = {}) 
   });
 }
 
-function registerMixFinal(server, API_KEY) {
-  const originalListeners = server.listeners("request").slice();
-  server.removeAllListeners("request");
-
-  server.on("request", async (req, res) => {
-    if (req.method === "POST" && req.url === "/mix-final") {
-      return handleMixFinal(req, res, API_KEY);
-    }
-    // Fall through to the original handler
-    for (const listener of originalListeners) listener(req, res);
-  });
-}
+// Route descriptor — registered once in index.js's single route table.
+const routeMixFinal = { method: "POST", path: "/mix-final", handler: handleMixFinal };
 
 // Build the per-clip filter chain (identical to the legacy single-pass design).
 // Input label is [<inIdx>:a]; output label is [<outLabel>]. Pulled out so the
@@ -361,4 +351,4 @@ async function handleMixFinal(req, res, API_KEY) {
   }
 }
 
-module.exports = { registerMixFinal };
+module.exports = { routeMixFinal };
