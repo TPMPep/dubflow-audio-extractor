@@ -199,18 +199,7 @@ async function handleProxyGenSync(req, res, API_KEY) {
   }
 }
 
-function registerProxyGen(server, API_KEY) {
-  // Wrap existing request handler — same convention as proxyGenerator (legacy)
-  // and hlsIngest.
-  const previousListener = server.listeners("request")[0];
-  server.removeAllListeners("request");
+// Route descriptor — registered once in index.js's single route table.
+const routeProxyGen = { method: "POST", path: "/generate-proxy-sync", handler: handleProxyGenSync };
 
-  server.on("request", async (req, res) => {
-    if (req.method === "POST" && req.url === "/generate-proxy-sync") {
-      return handleProxyGenSync(req, res, API_KEY);
-    }
-    if (previousListener) previousListener(req, res);
-  });
-}
-
-module.exports = { registerProxyGen };
+module.exports = { routeProxyGen };
