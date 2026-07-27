@@ -37,6 +37,43 @@ const { spawnSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+
+// ── True frame-rate probe (ffprobe) ──────────────────────────────────────────
+// The authoritative, machine-MEASURED frame rate of the source video. This is
+// the enterprise root fix for the SCC frame-rate problem: Project.frame_rate was
+// historically an operator-entered / defaulted number (83% sat at the schema
+// default of 25), so SCC timecodes — which are frame-COUNTED — could be divided
+// by a value nobody verified. ffprobe is already in the ffmpeg image (zero new
+// dependency); we read r_frame_rate ("24000/1001") and evaluate the rational to
+// a float (23.976). Best-effort: any failure returns null so the finalizer keeps
+// the existing value rather than overwriting truth with a worse guess. SOC 2
+// CC8.1 — a measured fps is provably distinct from a defaulted one.
+function probeSourceFrameRate(sourceUrl) {
+  try {
+    const probe = spawnSync("ffprobe", [
+      "-v", "error",
+      "-select_streams", "v:0",
+      "-show_entries", "stream=r_frame_rate",
+      "-of", "default=noprint_wrappers=1:nokey=1",
+      sourceUrl,
+    ], { timeout: 60_000, maxBuffer: 1024 * 1024, encoding: "utf8" });
+    if (probe.status !== 0) return null;
+    const raw = String(probe.stdout || "").trim().split(/\s+/)[0] || "";
+    // r_frame_rate is a rational "num/den" (e.g. "24000/1001", "25/1").
+    const m = raw.match(/^(\d+)\/(\d+)$/);
+    let fps;
+    if (m) {
+      const num = Number(m[1]); const den = Number(m[2]);
+      fps = den > 0 ? num / den : NaN;
+    } else {
+      fps = Number(raw);
+    }
+    if (!Number.isFinite(fps) || fps <= 0 || fps > 240) return null; // sane broadcast bounds
+    return Math.round(fps * 1000) / 1000; // 3-dp: 23.976, 29.97, 25, 24, 59.94
+  } catch {
+    return null;
+  }
+}
 // Zero-dependency WebCrypto SigV4 signer (replaces @aws-sdk/@smithy — incident
 // 2026-07-07/08). STS session-token aware. See ./s3-signer.js.
 const { putS3Object, storageFromEnv } = require("./s3-signer");
@@ -156,6 +193,9 @@ async function handleProxyGenSync(req, res, API_KEY) {
       }));
     }
 
+    // Probe the SOURCE's true frame rate (best-effort — never blocks the proxy).
+    const sourceFrameRate = probeSourceFrameRate(source_url);
+
     const storage = storageFromEnv({ region, bucket, prefix: credential_secret_prefix });
     const videoBuffer = fs.readFileSync(videoPath);
     const audioBuffer = fs.readFileSync(audioPath);
@@ -183,6 +223,9 @@ async function handleProxyGenSync(req, res, API_KEY) {
       bytes_video: videoBuffer.length,
       bytes_audio: audioBuffer.length,
       duration_ms: durationMs,
+      // Machine-measured source frame rate (null if the probe failed). The
+      // finalizer writes it to Project.frame_rate with frame_rate_source='ffprobe'.
+      source_frame_rate: sourceFrameRate,
       project_id,
     }));
   } catch (err) {
