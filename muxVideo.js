@@ -39,17 +39,8 @@
 const { execSync } = require("child_process");
 const fs = require("fs");
 
-function registerMuxVideo(server, API_KEY) {
-  const originalListeners = server.listeners("request").slice();
-  server.removeAllListeners("request");
-
-  server.on("request", async (req, res) => {
-    if (req.method === "POST" && req.url === "/mux-video") {
-      return handleMuxVideo(req, res, API_KEY);
-    }
-    for (const listener of originalListeners) listener(req, res);
-  });
-}
+// Route descriptor — registered once in index.js's single route table.
+const routeMuxVideo = { method: "POST", path: "/mux-video", handler: handleMuxVideo };
 
 async function handleMuxVideo(req, res, API_KEY) {
   const chunks = [];
@@ -179,4 +170,4 @@ async function handleMuxVideo(req, res, API_KEY) {
   }
 }
 
-module.exports = { registerMuxVideo };
+module.exports = { routeMuxVideo };
