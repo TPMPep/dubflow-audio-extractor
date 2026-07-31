@@ -22,14 +22,23 @@
 // New endpoint: POST /generate-proxy-sync
 //   • Synchronous reply on the SAME connection (no 202, no callback).
 //   • The worker holds the connection (long-timeout fetch + lock heartbeat).
-//   • NON-BLOCKING async spawn (2026-07-31): stderr/stdout/exit-code/signal are
-//     ALL captured even on failure, WITHOUT freezing the Node event loop for the
-//     transcode. This is the standalone fix that keeps /health responsive while
-//     a long proxy transcode runs — it does NOT depend on any concurrency gate
-//     (the semaphore was reverted the same day; see index.js). The prior
+//   • NON-BLOCKING async spawn: stderr/stdout/exit-code/signal are ALL captured
+//     even on failure, WITHOUT freezing the Node event loop for the transcode.
+//     Keeps /health responsive while a long proxy transcode runs. The prior
 //     spawnSync design blocked the single-threaded event loop for the whole
 //     transcode, so one stuck proxy pinned the loop and the box appeared to
 //     "die after a bit". async spawn cures that at the root.
+//   • STREAMING S3 upload: the finished proxy streams from disk → S3 with a
+//     bounded ~64KB memory footprint (putS3ObjectStreaming). The old
+//     readFileSync + putS3Object loaded the ENTIRE proxy (hundreds of MB for a
+//     broadcast master) into RAM three times over — the dominant OOM source.
+//   • HEAVY-LANE FAST-503 GATE: a bounded semaphore caps concurrent heavy proxy
+//     transcodes (default 2, EXTRACTOR_MAX_PROXY). When full it returns HTTP 503
+//     IMMEDIATELY (Retry-After) and the BullMQ worker retries with backoff — no
+//     held-open connection, so Cloudflare 524s are structurally impossible. This
+//     is the FAST-503 design, NOT the reverted long-acquire-wait queue. Together
+//     the streaming upload + the gate end the OOM → SIGKILL → 502 death spiral
+//     that concurrent ProRes masters triggered.
 //
 // The legacy /generate-proxy route is DELETED. Any caller still using it
 // gets a clean 404 — easier to detect + fix than a silent compatibility
@@ -119,7 +128,20 @@ async function probeSourceFrameRate(sourceUrl) {
 }
 // Zero-dependency WebCrypto SigV4 signer (replaces @aws-sdk/@smithy — incident
 // 2026-07-07/08). STS session-token aware. See ./s3-signer.js.
-const { putS3Object, storageFromEnv } = require("./s3-signer");
+const { putS3ObjectStreaming, createSemaphore, storageFromEnv } = require("./s3-signer");
+
+// ── Heavy-lane concurrency gate (FAST-503) ───────────────────────────────────
+// Proxy generation is the single most memory-heavy route: decoding a broadcast
+// master (ProRes/DNx 10-bit 4:2:2) + encoding a 720p H.264 proxy + a FLAC audio
+// proxy, all at once, is the dominant OOM source. Cap concurrent heavy proxy
+// transcodes so N of them can never OOM the container simultaneously. Default 2
+// (tunable via EXTRACTOR_MAX_PROXY without a redeploy) — comfortably safe on the
+// 24-vCPU box while still processing two proxies in parallel. When the lane is
+// full we return HTTP 503 IMMEDIATELY (no held-open connection, no 524 risk);
+// the BullMQ worker retries with its own exponential backoff. SOC 2 CC7.2.
+const PROXY_SEMAPHORE = createSemaphore(
+  Math.max(1, Math.min(6, Number(process.env.EXTRACTOR_MAX_PROXY) || 2)),
+);
 
 async function handleProxyGenSync(req, res, API_KEY) {
   const t0 = Date.now();
@@ -160,11 +182,33 @@ async function handleProxyGenSync(req, res, API_KEY) {
     try { return new URL(source_url).host; } catch { return "unparseable"; }
   })();
 
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `proxy-${project_id}-`));
-  const videoPath = path.join(tmpDir, "proxy.mp4");
-  const audioPath = path.join(tmpDir, "proxy.flac");
+  // ── Acquire a heavy-lane slot (FAST-503) ──
+  // All validation above is cheap and slot-free. Only the memory-heavy
+  // transcode below consumes a slot. If the lane is full, return 503 NOW so the
+  // worker retries with backoff — never hold this connection open waiting (that
+  // was the reverted gate's 524 bug). SOC 2 CC7.2.
+  if (!PROXY_SEMAPHORE.tryAcquire()) {
+    console.warn(`[generate-proxy-sync] ${project_id} heavy lane full (${PROXY_SEMAPHORE.inUse()}/${PROXY_SEMAPHORE.max}) — returning 503 for worker retry`);
+    res.writeHead(503, { "Content-Type": "application/json", "Retry-After": "30" });
+    return res.end(JSON.stringify({
+      error: "proxy_lane_busy",
+      message: `Heavy transcode lane full (${PROXY_SEMAPHORE.inUse()}/${PROXY_SEMAPHORE.max}). Retry shortly.`,
+      project_id,
+      retryable: true,
+    }));
+  }
+
+  // tmpDir creation is INSIDE the try so that a mkdtempSync failure (e.g. disk
+  // full) after tryAcquire() still hits the finally that releases the slot — a
+  // slot leaked on a rare pre-transcode throw would permanently shrink capacity.
+  let tmpDir = null;
+  const videoName = "proxy.mp4";
+  const audioName = "proxy.flac";
 
   try {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `proxy-${project_id}-`));
+    const videoPath = path.join(tmpDir, videoName);
+    const audioPath = path.join(tmpDir, audioName);
     console.log(`[generate-proxy-sync] ${project_id} starting`, {
       source_host: sourceHost,
       bucket,
@@ -257,7 +301,7 @@ async function handleProxyGenSync(req, res, API_KEY) {
         duration_ms: Date.now() - t0,
       };
       console.error(`[generate-proxy-sync] ${project_id} ffmpeg failed`, diagnostic);
-      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+      try { if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
       // 4xx → worker's UnrecoverableError → no retry, straight to DLQ.
       // ffmpeg non-zero exit is deterministic; retrying wastes another
       // 5-15min of compute and produces an identical failure row.
@@ -274,19 +318,22 @@ async function handleProxyGenSync(req, res, API_KEY) {
     const sourceFrameRate = await probeSourceFrameRate(source_url);
 
     const storage = storageFromEnv({ region, bucket, prefix: credential_secret_prefix });
-    const videoBuffer = fs.readFileSync(videoPath);
-    const audioBuffer = fs.readFileSync(audioPath);
-
-    await Promise.all([
-      putS3Object(storage, proxy_video_key, videoBuffer, { contentType: "video/mp4" }),
-      putS3Object(storage, proxy_audio_key, audioBuffer, { contentType: "audio/flac" }),
-    ]);
+    // STREAMING uploads — never load the proxy into RAM (the OOM cure). Each
+    // proxy streams from disk → S3 with a bounded ~64KB footprint regardless of
+    // file size. Sizes are read from fs.stat (in putS3ObjectStreaming), not by
+    // buffering the file. Run sequentially: two large concurrent stream-uploads
+    // still each hold only a small buffer, but sequential keeps peak network +
+    // fd usage predictable on the shared box.
+    const videoRes = await putS3ObjectStreaming(storage, proxy_video_key, videoPath, { contentType: "video/mp4" });
+    const audioRes = await putS3ObjectStreaming(storage, proxy_audio_key, audioPath, { contentType: "audio/flac" });
+    const videoBytes = videoRes.bytes;
+    const audioBytes = audioRes.bytes;
 
     const durationMs = Date.now() - t0;
     console.log(
       `[generate-proxy-sync] ${project_id} ready ` +
-      `(video ${(videoBuffer.length / 1024 / 1024).toFixed(0)}MB, ` +
-      `audio ${(audioBuffer.length / 1024 / 1024).toFixed(0)}MB, ` +
+      `(video ${(videoBytes / 1024 / 1024).toFixed(0)}MB, ` +
+      `audio ${(audioBytes / 1024 / 1024).toFixed(0)}MB, ` +
       `duration ${durationMs}ms)`
     );
 
@@ -297,8 +344,8 @@ async function handleProxyGenSync(req, res, API_KEY) {
     return res.end(JSON.stringify({
       proxy_video_key,
       proxy_audio_key,
-      bytes_video: videoBuffer.length,
-      bytes_audio: audioBuffer.length,
+      bytes_video: videoBytes,
+      bytes_audio: audioBytes,
       duration_ms: durationMs,
       // Machine-measured source frame rate (null if the probe failed). The
       // finalizer writes it to Project.frame_rate with frame_rate_source='ffprobe'.
@@ -307,15 +354,22 @@ async function handleProxyGenSync(req, res, API_KEY) {
     }));
   } catch (err) {
     console.error(`[generate-proxy-sync] ${project_id} fatal:`, err.message, err.stack);
-    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
-    // 5xx → worker retries once (BullMQ PROXY_GEN_JOB_OPTIONS.attempts=2).
-    // Transient: S3 5xx, transient network blip, ENOENT on tmp.
+    try { if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    // 5xx → worker retries per BullMQ PROXY_GEN_JOB_OPTIONS (attempts=6, so
+    // transient/lane-busy cases get ample backoff headroom). Transient here:
+    // S3 5xx, network blip, ENOENT on tmp.
     res.writeHead(500);
     return res.end(JSON.stringify({
       error: "proxy_gen_failed",
       message: String(err.message || err).slice(0, 1000),
       project_id,
     }));
+  } finally {
+    // ALWAYS release the heavy-lane slot — success, ffmpeg failure, or fatal.
+    // A leaked slot would permanently shrink capacity and eventually wedge the
+    // lane. This finally is the single release point paired with the tryAcquire
+    // above. SOC 2 CC7.2.
+    PROXY_SEMAPHORE.release();
   }
 }
 
