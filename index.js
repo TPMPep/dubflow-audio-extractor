@@ -48,6 +48,11 @@ const { routeProxyGen } = require("./proxyGenerator");
 const { routeHlsIngest } = require("./hlsIngest");
 const { routeHashFile } = require("./hashFile");
 const { routeBurnSubtitles } = require("./burnSubtitles");
+// Bounded FFmpeg concurrency gate (2026-07-31 — structural cure for the
+// unbounded-concurrency wedge). Heavy transcodes queue behind a bounded pool;
+// light clip ops run on a separate higher pool; /health never gates. See
+// ./semaphore.js.
+const { withConcurrencyGate, semaphoreStats } = require("./semaphore");
 
 const BUCKET = process.env.S3_BUCKET || "pep-test";
 const AWS_REGION = process.env.AWS_REGION || "us-west-2";
@@ -62,7 +67,7 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-07-31-nonblocking-handlers";
+const BUILD_TAG = "extractor-2026-07-31-concurrency-semaphore";
 
 // ── Non-blocking ffprobe (SOC 2 CC7.2 — never freeze the loop) ──
 // execSync(ffprobe) blocks the single-threaded event loop for the whole probe.
@@ -105,7 +110,16 @@ function runFfprobe(args, { timeoutMs = 10000 } = {}) {
 // behavior is byte-for-byte unchanged — only the dispatch mechanism moved.
 // =============================================================================
 const routes = new Map();
-function route(descriptor) { routes.set(`${descriptor.method} ${descriptor.path}`, descriptor.handler); }
+// Every non-health route is wrapped in the bounded concurrency gate so no route
+// can ever run more heavy FFmpeg jobs than the pool allows. /health is NEVER
+// registered here — it is answered directly in the request handler below and
+// never acquires a slot, so it always responds instantly (the liveness proof).
+function route(descriptor) {
+  routes.set(
+    `${descriptor.method} ${descriptor.path}`,
+    withConcurrencyGate(descriptor.path, descriptor.handler),
+  );
+}
 
 // ── Extract speaker audio segments ──
 async function handleExtract(req, res, API_KEY) {
@@ -830,8 +844,12 @@ route(routeBurnSubtitles);
 const server = http.createServer(async (req, res) => {
   // /health first — cheapest path, never touches the route table.
   if (req.method === "GET" && req.url === "/health") {
+    // /health NEVER acquires a semaphore slot — it must answer instantly even
+    // when every heavy slot is busy, which is exactly what proves the box is
+    // alive under load. We surface live concurrency stats so an operator can
+    // see the gate working (heavy in_flight/waiting) without shelling in.
     res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ status: "ok", build_tag: BUILD_TAG }));
+    return res.end(JSON.stringify({ status: "ok", build_tag: BUILD_TAG, concurrency: semaphoreStats() }));
   }
 
   // ONE dispatch, ONE handler per request. A matched handler owns the response
