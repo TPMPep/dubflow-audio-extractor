@@ -24,6 +24,10 @@
 // EXPORTS (only what index.js / hlsIngest.js / proxyGenerator.js need):
 //   • presignS3Url({ method, storage, key, expiresIn, extraQuery })  → string
 //   • putS3Object(storage, key, body, { contentType, timeoutMs })    → { ok }
+//   • putS3ObjectStreaming(storage, key, filePath, { contentType })  → { ok }
+//       streams a file from disk → S3 with NO in-memory buffering (OOM cure)
+//   • createSemaphore(max)  → { tryAcquire, release, inUse, max }
+//       shared FAST-503 bounded concurrency gate for heavy routes
 //   • storageFromEnv({ region, bucket, prefix })                     → handle
 //   • storageFromExplicit({ region, bucket, accessKeyId, secretAccessKey,
 //                           sessionToken, endpoint })                → handle
@@ -32,6 +36,7 @@
 //                                              sessionToken|undefined } }
 // =============================================================================
 
+const fs = require("fs");
 const _te = new TextEncoder();
 function _hex(bytes) { let s = ""; for (const b of bytes) s += b.toString(16).padStart(2, "0"); return s; }
 async function _sha256Hex(str) { return _hex(new Uint8Array(await crypto.subtle.digest("SHA-256", _te.encode(str)))); }
@@ -127,6 +132,95 @@ async function putS3Object(storage, key, body, { contentType, timeoutMs = 120000
   } finally { clearTimeout(t); }
 }
 
+// ── STREAMING S3 upload — the OOM cure for large proxy/mix deliverables ──────
+// putS3Object() above hashes the WHOLE body in memory and hands the entire
+// Buffer to fetch — fine for small audio clips, FATAL for a 540MB ProRes proxy
+// (fs.readFileSync loads the whole proxy into RAM, then the SHA-256 digest
+// holds a second copy, then fetch buffers a third). Under concurrent heavy
+// transcodes that is the exact OOM → SIGKILL → Railway 502 "Application failed
+// to respond" death spiral we hit on broadcast masters.
+//
+// This variant NEVER loads the object into RAM. It streams the file from disk
+// directly into the fetch body (Node auto-frames it as a chunked/known-length
+// stream), and it uses the SigV4 STREAMING-UNSIGNED-PAYLOAD content marker
+// (UNSIGNED-PAYLOAD) so the payload hash is NOT required up front — the whole
+// point is to avoid reading the file to hash it. AWS S3 accepts
+// UNSIGNED-PAYLOAD over HTTPS (the TLS channel provides integrity); this is the
+// same posture our presigned PUTs already use. Content-Length is provided from
+// fs.stat so S3 gets an exact byte count with no in-memory buffering.
+//
+// STS-aware, identical to putS3Object. Peak memory is bounded by the stream
+// highWaterMark (~64KB), NOT the file size — a 1GB proxy uploads with the same
+// memory footprint as a 1MB clip.
+async function putS3ObjectStreaming(storage, key, filePath, { contentType, timeoutMs = 30 * 60 * 1000 } = {}) {
+  const { region, creds: { accessKeyId, secretAccessKey, sessionToken }, endpoint, bucket } = storage;
+  const stat = fs.statSync(filePath);
+  const contentLength = stat.size;
+  const now = new Date();
+  const amzDate = now.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+  const dateStamp = amzDate.slice(0, 8);
+  const scope = `${dateStamp}/${region}/s3/aws4_request`;
+  let host, canonicalUri;
+  if (endpoint) { host = new URL(endpoint).host; canonicalUri = `/${bucket}/${_awsEncodePath(key)}`; }
+  else { host = `${bucket}.s3.${region}.amazonaws.com`; canonicalUri = `/${_awsEncodePath(key)}`; }
+  // UNSIGNED-PAYLOAD: the payload hash is the fixed marker, so we never read the
+  // file to compute a SHA-256. TLS guarantees transport integrity.
+  const payloadHash = "UNSIGNED-PAYLOAD";
+  const headers = { host, "x-amz-content-sha256": payloadHash, "x-amz-date": amzDate };
+  if (contentType) headers["content-type"] = contentType;
+  if (sessionToken) headers["x-amz-security-token"] = sessionToken;
+  const sortedHeaderKeys = Object.keys(headers).sort();
+  const signedHeaders = sortedHeaderKeys.join(";");
+  const canonicalHeaders = sortedHeaderKeys.map((h) => `${h}:${headers[h]}\n`).join("");
+  const canonicalRequest = ["PUT", canonicalUri, "", canonicalHeaders, signedHeaders, payloadHash].join("\n");
+  const stringToSign = ["AWS4-HMAC-SHA256", amzDate, scope, await _sha256Hex(canonicalRequest)].join("\n");
+  const signature = _hex(await _hmac(await _signingKey(secretAccessKey, dateStamp, region), stringToSign));
+  const authorization = `AWS4-HMAC-SHA256 Credential=${accessKeyId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+  // Stream the file from disk. `duplex: 'half'` is REQUIRED by the Node/undici
+  // fetch when the body is a stream. Content-Length lets S3 pre-allocate and
+  // avoids chunked-transfer ambiguity.
+  const bodyStream = fs.createReadStream(filePath);
+  try {
+    const res = await fetch(`https://${host}${canonicalUri}`, {
+      method: "PUT",
+      headers: { ...headers, authorization, "content-length": String(contentLength) },
+      body: bodyStream,
+      duplex: "half",
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`S3 streaming PUT ${key} -> HTTP ${res.status}: ${text.slice(0, 300)}`);
+    }
+    return { ok: true, status: res.status, bytes: contentLength };
+  } finally {
+    clearTimeout(t);
+    try { bodyStream.destroy(); } catch (_) { /* already closed */ }
+  }
+}
+
+// ── Bounded concurrency semaphore — SHARED heavy-lane gate primitive ─────────
+// Single source of truth for the "cap N heavy transcodes at once" pattern. This
+// is deliberately a FAST-503 gate, NOT a long acquire-wait queue: the reverted
+// gate (see index.js history) held callers in a FIFO wait for up to 10 min,
+// which is ~6× longer than Cloudflare's ~100s edge tolerates a silent
+// connection — so a queued export always 524'd before it ran. Here, tryAcquire
+// returns false IMMEDIATELY when the lane is full; the caller returns HTTP 503
+// and the BullMQ worker owns the wait via its own exponential backoff. No HTTP
+// connection is ever held open waiting for a slot, so a 524 is structurally
+// impossible. SOC 2 CC7.2 — bounded, observable, never-wedging concurrency.
+function createSemaphore(max) {
+  let inUse = 0;
+  return {
+    max,
+    inUse: () => inUse,
+    tryAcquire() { if (inUse >= max) return false; inUse++; return true; },
+    release() { if (inUse > 0) inUse--; },
+  };
+}
+
 // ── Credential resolution helpers ───────────────────────────────────────────
 // Resolve creds from env, honoring an optional profile prefix AND its
 // prefix-scoped session token. Long-lived AKIA creds have no *_SESSION_TOKEN,
@@ -161,4 +255,4 @@ function storageFromExplicit({ region, bucket, accessKeyId, secretAccessKey, ses
   return { region, bucket, endpoint, creds: { accessKeyId, secretAccessKey, sessionToken: sessionToken || undefined } };
 }
 
-module.exports = { presignS3Url, putS3Object, storageFromEnv, storageFromExplicit };
+module.exports = { presignS3Url, putS3Object, putS3ObjectStreaming, createSemaphore, storageFromEnv, storageFromExplicit };
