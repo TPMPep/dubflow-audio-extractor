@@ -178,14 +178,50 @@ async function handleProxyGenSync(req, res, API_KEY) {
     // Args array (NOT shell string) so spawnSync can capture stderr cleanly
     // and we don't have shell-quoting issues with signed URLs.
     // ────────────────────────────────────────────────────────────────────
+    // ── PRO-CODEC MASTER HARDENING (2026-07-31) ───────────────────────────
+    // Broadcast masters arrive as ProRes 422 (HQ), DNxHD/DNxHR, and other
+    // pro intermediates — NOT web-friendly H.264. Two things about these
+    // sources break a naive proxy transcode, and both are fixed HERE so the
+    // whole ingest path is correct for professional media, not just a one-off
+    // patch for a single file:
+    //
+    //   1. DECODER THREAD-INIT FAILURE (the actual failure we hit):
+    //      "Error while opening decoder for input stream #0:0 : Resource
+    //      temporarily unavailable" is FFmpeg's ProRes/DNx decoder failing to
+    //      spin up its default auto-thread pool inside a constrained Railway
+    //      container. Forcing single-threaded DECODE init (`-threads 1` BEFORE
+    //      `-i`) makes the decoder open deterministically. This is an
+    //      input/decode-side flag — it does NOT slow the H.264 ENCODE (that
+    //      still uses libx264's own threading).
+    //
+    //   2. 10-bit 4:2:2 PIXEL FORMAT:
+    //      ProRes 422 is 10-bit 4:2:2. Standard-profile H.264 (libx264) cannot
+    //      encode 4:2:2/10-bit without an explicit downconvert — even once the
+    //      decoder opens, the encode would fail. `format=yuv420p` in the filter
+    //      chain normalizes every pro source to the 8-bit 4:2:0 the 720p editor
+    //      proxy needs. Web-friendly H.264 sources are already yuv420p, so this
+    //      is a no-op for them — safe for EVERY source, not just ProRes.
+    //
+    // `-fflags +genpts` + `-err_detect ignore_err` keep a master with benign
+    // container quirks (missing PTS on an intermediate, a non-fatal stream
+    // error) from aborting the whole transcode. `-map 0:v:0? / 0:a:0?` already
+    // tolerate absent streams. Net effect: pro broadcast masters proxy
+    // reliably, and nothing about the H.264/web-source path changes.
     const ffmpegArgs = [
       "-hide_banner", "-loglevel", "error",
+      // Decode-side hardening (BEFORE -i): deterministic decoder init +
+      // tolerant demux for pro-codec / intermediate masters.
+      "-threads", "1",
+      "-fflags", "+genpts",
+      "-err_detect", "ignore_err",
       "-i", source_url,
-      // Video proxy: 720p H.264 ~2 Mbps, AAC 128k stereo
+      // Video proxy: 720p H.264 ~2 Mbps, AAC 128k stereo.
+      // format=yuv420p downconverts 10-bit 4:2:2 ProRes/DNx to the 8-bit 4:2:0
+      // H.264 the editor proxy needs (no-op for already-yuv420p sources).
       "-map", "0:v:0?", "-map", "0:a:0?",
       "-c:v", "libx264", "-preset", "fast",
       "-b:v", "2M", "-maxrate", "2.5M", "-bufsize", "4M",
-      "-vf", "scale=-2:720",
+      "-vf", "scale=-2:720,format=yuv420p",
       "-c:a", "aac", "-b:a", "128k", "-ac", "2",
       "-movflags", "+faststart",
       "-f", "mp4", videoPath,
