@@ -22,21 +22,66 @@
 // New endpoint: POST /generate-proxy-sync
 //   • Synchronous reply on the SAME connection (no 202, no callback).
 //   • The worker holds the connection (long-timeout fetch + lock heartbeat).
-//   • spawnSync with stdio piped: stderr/stdout/exit-code/signal are ALL
-//     captured even on failure. Node is single-purpose per request: the
-//     worker is the only caller, only one job runs at a time on this dyno
-//     (CONCURRENCY_PROXY_GEN=1), and the worker holds the connection so
-//     /health responsiveness is no longer the success criterion.
+//   • NON-BLOCKING async spawn (2026-07-31): stderr/stdout/exit-code/signal are
+//     ALL captured even on failure, WITHOUT freezing the Node event loop for the
+//     transcode. Concurrency is bounded by the extractor's shared semaphore
+//     (index.js) — heavy transcodes queue behind a per-replica pool instead of
+//     all running at once, so a burst of proxy jobs (e.g. 4 worker replicas)
+//     can never saturate the box or block /health. The prior spawnSync design
+//     assumed one-job-at-a-time on the dyno; that assumption was never enforced
+//     and broke under multiple replicas — the 2026-07-31 wedge. The gate now
+//     enforces it structurally.
 //
 // The legacy /generate-proxy route is DELETED. Any caller still using it
 // gets a clean 404 — easier to detect + fix than a silent compatibility
 // shim. Base44's generateProxy function has been rewritten to call the
 // BullMQ worker instead of this endpoint directly.
 
-const { spawnSync } = require("child_process");
+const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+
+// ── Async, NON-BLOCKING ffmpeg/ffprobe runner (SOC 2 CC7.2) ──────────────────
+// The 2026-07-31 root fix for proxy-gen: spawnSync BLOCKS the single-threaded
+// Node event loop for the ENTIRE transcode (up to 3.5hr). While one proxy job
+// grinds, the whole service stalls — /health included — which is exactly the
+// "works after restart, dies after a bit" wedge (one stuck proxy pinned the
+// loop). spawn() runs the child WITHOUT blocking the loop, so the service stays
+// responsive and the concurrency semaphore (index.js) can cleanly bound how
+// many run at once. Resolves { status, signal, stdout, stderr } on exit;
+// rejects only on spawn failure (ENOENT) or the hard timeout SIGKILL.
+function runProcess(bin, args, { timeoutMs, maxOutputBytes = 4 * 1024 * 1024 } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timer = timeoutMs ? setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { child.kill("SIGKILL"); } catch (_) { /* already gone */ }
+      resolve({ status: null, signal: "SIGTERM", stdout, stderr, timedOut: true });
+    }, timeoutMs) : null;
+    // Drain BOTH pipes so a chatty child never back-pressures and deadlocks
+    // (the classic spawn pitfall). Cap retained output so a runaway log can't
+    // balloon memory — ffmpeg errors live in the last few KB anyway.
+    child.stdout.on("data", (d) => { if (stdout.length < maxOutputBytes) stdout += d.toString(); });
+    child.stderr.on("data", (d) => { if (stderr.length < maxOutputBytes) stderr += d.toString(); });
+    child.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      reject(err); // ENOENT (bin missing) etc.
+    });
+    child.on("close", (code, signal) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve({ status: code, signal, stdout, stderr, timedOut: false });
+    });
+  });
+}
 
 // ── True frame-rate probe (ffprobe) ──────────────────────────────────────────
 // The authoritative, machine-MEASURED frame rate of the source video. This is
@@ -48,15 +93,15 @@ const os = require("os");
 // a float (23.976). Best-effort: any failure returns null so the finalizer keeps
 // the existing value rather than overwriting truth with a worse guess. SOC 2
 // CC8.1 — a measured fps is provably distinct from a defaulted one.
-function probeSourceFrameRate(sourceUrl) {
+async function probeSourceFrameRate(sourceUrl) {
   try {
-    const probe = spawnSync("ffprobe", [
+    const probe = await runProcess("ffprobe", [
       "-v", "error",
       "-select_streams", "v:0",
       "-show_entries", "stream=r_frame_rate",
       "-of", "default=noprint_wrappers=1:nokey=1",
       sourceUrl,
-    ], { timeout: 60_000, maxBuffer: 1024 * 1024, encoding: "utf8" });
+    ], { timeoutMs: 60_000 });
     if (probe.status !== 0) return null;
     const raw = String(probe.stdout || "").trim().split(/\s+/)[0] || "";
     // r_frame_rate is a rational "num/den" (e.g. "24000/1001", "25/1").
@@ -151,27 +196,25 @@ async function handleProxyGenSync(req, res, API_KEY) {
       "-c:a", "flac", "-f", "flac", audioPath,
     ];
 
-    // spawnSync with encoding:'utf8' returns stderr/stdout as strings (not
-    // Buffers) and populates them EVEN on non-zero exit — unlike execSync,
-    // which leaves err.stderr as null in many failure paths. This is the
-    // key to enterprise-grade observability: every failure mode is now
-    // legible in the response body AND in Railway's structured logs.
-    const result = spawnSync("ffmpeg", ffmpegArgs, {
-      timeout: 3.5 * 60 * 60 * 1000,
-      maxBuffer: 50 * 1024 * 1024,
-      encoding: "utf8",
+    // NON-BLOCKING spawn (2026-07-31). runProcess drains stdout/stderr as
+    // strings and captures exit code + signal EVEN on failure — same legible
+    // observability as the old spawnSync, but WITHOUT freezing the event loop
+    // for the whole transcode. A spawn-level failure (ENOENT: ffmpeg missing)
+    // rejects and is caught by the outer try/catch below as a 500. A hard
+    // timeout resolves with timedOut=true + signal 'SIGTERM'.
+    const result = await runProcess("ffmpeg", ffmpegArgs, {
+      timeoutMs: 3.5 * 60 * 60 * 1000,
     });
 
-    if (result.status !== 0 || result.signal || result.error) {
+    if (result.status !== 0 || result.signal) {
       const stderr = (result.stderr || "").toString();
       const stdout = (result.stdout || "").toString();
       const diagnostic = {
         exit_code: result.status,                              // null if killed by signal
         signal: result.signal,                                 // SIGKILL=OOM, SIGTERM=timeout
+        timed_out: result.timedOut || false,                   // hard 3.5hr ceiling hit
         stderr_tail: stderr.slice(-2000) || "(empty)",
         stdout_tail: stdout.slice(-500) || "(empty)",
-        spawn_error_kind: result.error?.code || null,          // ENOENT (ffmpeg missing), ETIMEDOUT, etc.
-        spawn_error_message: result.error?.message || null,
         source_host: sourceHost,
         // Redacted argv — replace the full signed URL with just its host
         // so the audit trail proves what we invoked without leaking the
@@ -194,7 +237,7 @@ async function handleProxyGenSync(req, res, API_KEY) {
     }
 
     // Probe the SOURCE's true frame rate (best-effort — never blocks the proxy).
-    const sourceFrameRate = probeSourceFrameRate(source_url);
+    const sourceFrameRate = await probeSourceFrameRate(source_url);
 
     const storage = storageFromEnv({ region, bucket, prefix: credential_secret_prefix });
     const videoBuffer = fs.readFileSync(videoPath);
