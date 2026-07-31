@@ -1,7 +1,7 @@
 /* eslint-env node */
 /* eslint-disable no-undef */
 const http = require("http");
-const { execSync, spawn } = require("child_process");
+const { spawn } = require("child_process");
 const fs = require("fs");
 
 // ── Async, non-blocking ffmpeg runner (SOC 2 CC7.2 — never freeze the loop) ──
@@ -62,7 +62,27 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-07-27-single-router";
+const BUILD_TAG = "extractor-2026-07-31-nonblocking-handlers";
+
+// ── Non-blocking ffprobe (SOC 2 CC7.2 — never freeze the loop) ──
+// execSync(ffprobe) blocks the single-threaded event loop for the whole probe.
+// A slow/large/remote input therefore freezes EVERY concurrent request — even
+// /health stops answering (the exact "it goes down again" symptom). This runs
+// ffprobe via spawn and resolves the trimmed stdout, with a hard timeout that
+// kills a wedged child. Returns "" on any non-zero exit so callers can treat a
+// failed probe as "unknown duration" without a throw.
+function runFfprobe(args, { timeoutMs = 10000 } = {}) {
+  return new Promise((resolve) => {
+    const child = spawn("ffprobe", args, { stdio: ["ignore", "pipe", "ignore"] });
+    let stdout = "";
+    let settled = false;
+    const done = (val) => { if (settled) return; settled = true; clearTimeout(timer); resolve(val); };
+    const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch (_) { /* gone */ } done(""); }, timeoutMs);
+    child.stdout.on("data", (d) => { stdout += d.toString(); });
+    child.on("error", () => done(""));
+    child.on("close", (code) => done(code === 0 ? stdout.trim() : ""));
+  });
+}
 
 // =============================================================================
 // SINGLE EXPLICIT ROUTE TABLE (enterprise-grade — SOC 2 CC7.2).
@@ -237,10 +257,9 @@ async function handleTimeStretch(req, res, API_KEY) {
     const audioArrayBuffer = await downloadRes.arrayBuffer();
     fs.writeFileSync(inputFile, Buffer.from(audioArrayBuffer));
 
-    const probeResult = execSync(
-      `ffprobe -v quiet -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${inputFile}"`,
-      { timeout: 10000 }
-    ).toString().trim();
+    const probeResult = await runFfprobe(
+      ["-v", "quiet", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", inputFile],
+    );
 
     const originalDuration = parseFloat(probeResult);
     if (!originalDuration || originalDuration <= 0) {
@@ -279,10 +298,10 @@ async function handleTimeStretch(req, res, API_KEY) {
     console.log(`FFmpeg filter: ${filterStr}`);
 
     // Lossless path encodes pcm_s16le WAV; legacy path keeps lame MP3.
-    const tsCodecArgs = tsOutFmt === "wav" ? "-c:a pcm_s16le" : "-c:a libmp3lame -q:a 2";
-    execSync(
-      `ffmpeg -y -i "${inputFile}" -filter:a "${filterStr}" -vn ${tsCodecArgs} "${outputFile}" 2>/dev/null`,
-      { timeout: 30000 }
+    const tsCodecArgs = tsOutFmt === "wav" ? ["-c:a", "pcm_s16le"] : ["-c:a", "libmp3lame", "-q:a", "2"];
+    await runFfmpeg(
+      ["-y", "-i", inputFile, "-filter:a", filterStr, "-vn", ...tsCodecArgs, outputFile],
+      { timeoutMs: 30000, label: "Time-stretch" },
     );
 
     const stretchedBuffer = fs.readFileSync(outputFile);
@@ -300,17 +319,12 @@ async function handleTimeStretch(req, res, API_KEY) {
     if (Number.isFinite(originalDuration) && originalDuration > 0) {
       durationHeaders["X-Input-Duration-Ms"] = String(Math.round(originalDuration * 1000));
     }
-    try {
-      const outProbe = execSync(
-        `ffprobe -v quiet -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${outputFile}"`,
-        { timeout: 10000 }
-      ).toString().trim();
-      const outDurationSec = parseFloat(outProbe);
-      if (Number.isFinite(outDurationSec) && outDurationSec > 0) {
-        durationHeaders["X-Output-Duration-Ms"] = String(Math.round(outDurationSec * 1000));
-      }
-    } catch (probeErr) {
-      console.warn(`[time-stretch] output duration probe failed (non-fatal): ${probeErr.message}`);
+    const outProbe = await runFfprobe(
+      ["-v", "quiet", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", outputFile],
+    );
+    const outDurationSec = parseFloat(outProbe);
+    if (Number.isFinite(outDurationSec) && outDurationSec > 0) {
+      durationHeaders["X-Output-Duration-Ms"] = String(Math.round(outDurationSec * 1000));
     }
 
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -407,9 +421,19 @@ async function handleProcess(req, res, API_KEY) {
       : output_format === "flac"
         ? "-c:a flac"
         : "-c:a libmp3lame -q:a 2";
-    const cmd = `ffmpeg -y ${inputFlagsStr}-i "${inputFile}" -af "${filters}"${outputFlagsStr} ${procCodecArgs} "${outputFile}" 2>/dev/null`;
-    console.log(`[process] Running: ${cmd}`);
-    execSync(cmd, { timeout: 120000 });
+    // Build the arg array (spawn — non-blocking). inputFlags go before -i,
+    // outputFlags + codec after. procCodecArgs is a string pair we split.
+    const procArgs = [
+      "-y",
+      ...inputFlags,
+      "-i", inputFile,
+      "-af", filters,
+      ...outputFlags,
+      ...procCodecArgs.split(" "),
+      outputFile,
+    ];
+    console.log(`[process] Running: ffmpeg ${procArgs.join(" ")}`);
+    await runFfmpeg(procArgs, { timeoutMs: 120000, label: "Process" });
 
     const outputBuffer = fs.readFileSync(outputFile);
     console.log(`[process] Output: ${(outputBuffer.length / 1024).toFixed(0)}KB`);
@@ -420,17 +444,12 @@ async function handleProcess(req, res, API_KEY) {
     // estimate. Emitted as a response HEADER so the binary body contract is
     // untouched. ffprobe failure is non-fatal — degrades to absent header.
     const processDurationHeaders = {};
-    try {
-      const procProbe = execSync(
-        `ffprobe -v quiet -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${outputFile}"`,
-        { timeout: 10000 }
-      ).toString().trim();
-      const procDurationSec = parseFloat(procProbe);
-      if (Number.isFinite(procDurationSec) && procDurationSec > 0) {
-        processDurationHeaders["X-Output-Duration-Ms"] = String(Math.round(procDurationSec * 1000));
-      }
-    } catch (probeErr) {
-      console.warn(`[process] output duration probe failed (non-fatal): ${probeErr.message}`);
+    const procProbe = await runFfprobe(
+      ["-v", "quiet", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", outputFile],
+    );
+    const procDurationSec = parseFloat(procProbe);
+    if (Number.isFinite(procDurationSec) && procDurationSec > 0) {
+      processDurationHeaders["X-Output-Duration-Ms"] = String(Math.round(procDurationSec * 1000));
     }
 
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -508,11 +527,14 @@ async function handleTrim(req, res, API_KEY) {
     if (fade_out_ms > 0 && totalSec > parseFloat(fadeOutSec) * 2) {
       filters.push(`afade=t=out:st=${fadeOutStartSec}:d=${fadeOutSec}`);
     }
-    const filterArg = filters.length > 0 ? `-af "${filters.join(",")}"` : "";
+    const filterArgs = filters.length > 0 ? ["-af", filters.join(",")] : [];
 
-    const cmd = `ffmpeg -y -ss ${startSec} -t ${durationSec} -i "${inputFile}" ${filterArg} -c:a libmp3lame -q:a 2 -ac 1 -ar 44100 "${outputFile}" 2>/dev/null`;
-    console.log(`[trim] Running: ${cmd}`);
-    execSync(cmd, { timeout: 30000 });
+    const trimArgs = [
+      "-y", "-ss", startSec, "-t", durationSec, "-i", inputFile,
+      ...filterArgs, "-c:a", "libmp3lame", "-q:a", "2", "-ac", "1", "-ar", "44100", outputFile,
+    ];
+    console.log(`[trim] Running: ffmpeg ${trimArgs.join(" ")}`);
+    await runFfmpeg(trimArgs, { timeoutMs: 30000, label: "Trim" });
 
     const outputBuffer = fs.readFileSync(outputFile);
     console.log(`[trim] Output: ${(outputBuffer.length / 1024).toFixed(0)}KB, dur=${durationSec}s`);
@@ -569,25 +591,28 @@ async function handleSilenceDetect(req, res, API_KEY) {
     const audioArrayBuffer = await downloadRes.arrayBuffer();
     fs.writeFileSync(inputFile, Buffer.from(audioArrayBuffer));
 
-    // Get total duration
-    const probeOut = execSync(
-      `ffprobe -v quiet -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${inputFile}"`,
-      { timeout: 10000 }
-    ).toString().trim();
+    // Get total duration (non-blocking probe)
+    const probeOut = await runFfprobe(
+      ["-v", "quiet", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", inputFile],
+    );
     const durationSec = parseFloat(probeOut);
     if (!durationSec || durationSec <= 0) throw new Error("Could not determine audio duration");
 
-    // Run silencedetect — output goes to stderr, not stdout
-    let stderr = "";
-    try {
-      execSync(
-        `ffmpeg -i "${inputFile}" -af "silencedetect=noise=${silence_threshold_db}dB:d=${min_silence_duration_sec}" -f null - 2>&1`,
-        { timeout: 30000, encoding: "utf8" }
-      );
-    } catch (e) {
-      // ffmpeg writes to stderr; execSync throws when stdout is empty even on success
-      stderr = (e.stdout || "") + (e.stderr || "") + (e.message || "");
-    }
+    // Run silencedetect via spawn (non-blocking) — the measurements are printed
+    // to stderr, so we capture it (ffmpeg exits 0 here; a null muxer produces no
+    // file). This never freezes the event loop for concurrent callers.
+    const stderr = await new Promise((resolve) => {
+      const child = spawn("ffmpeg",
+        ["-i", inputFile, "-af", `silencedetect=noise=${silence_threshold_db}dB:d=${min_silence_duration_sec}`, "-f", "null", "-"],
+        { stdio: ["ignore", "ignore", "pipe"] });
+      let buf = "";
+      let settled = false;
+      const done = () => { if (settled) return; settled = true; clearTimeout(timer); resolve(buf); };
+      const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch (_) { /* gone */ } done(); }, 30000);
+      child.stderr.on("data", (d) => { buf += d.toString(); });
+      child.on("error", done);
+      child.on("close", done);
+    });
 
     // Parse silence_start / silence_end pairs
     const silenceStartRegex = /silence_start:\s*([\d.]+)/g;
@@ -683,16 +708,15 @@ async function handleNormalizeVoiceSample(req, res, API_KEY) {
     console.log(`[normalize] Downloaded ${(audioArrayBuffer.byteLength / 1024 / 1024).toFixed(2)} MB`);
 
     // Denoise + loudnorm → mono 44.1kHz 16-bit PCM WAV (ideal for ElevenLabs cloning)
-    execSync(
-      `ffmpeg -y -i "${inputFile}" -af "${ffmpeg_filter}" -ac 1 -ar 44100 -sample_fmt s16 -c:a pcm_s16le "${outputFile}" 2>/dev/null`,
-      { timeout: 120000 }
+    await runFfmpeg(
+      ["-y", "-i", inputFile, "-af", ffmpeg_filter, "-ac", "1", "-ar", "44100", "-sample_fmt", "s16", "-c:a", "pcm_s16le", outputFile],
+      { timeoutMs: 120000, label: "Normalize" },
     );
 
-    // Probe duration
-    const probeResult = execSync(
-      `ffprobe -v quiet -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${outputFile}"`,
-      { timeout: 10000 }
-    ).toString().trim();
+    // Probe duration (non-blocking)
+    const probeResult = await runFfprobe(
+      ["-v", "quiet", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", outputFile],
+    );
     const durationSec = parseFloat(probeResult) || 0;
 
     const outputBuffer = fs.readFileSync(outputFile);
@@ -767,9 +791,9 @@ async function handleConcat(req, res, API_KEY) {
     fs.writeFileSync(listFile, inputFiles.map(f => `file '${f}'`).join("\n"));
 
     const outputFile = `${tmpDir}/output.${output_format}`;
-    execSync(
-      `ffmpeg -f concat -safe 0 -i "${listFile}" -c:a libmp3lame -q:a 2 "${outputFile}" -y 2>/dev/null`,
-      { timeout: 120000 }
+    await runFfmpeg(
+      ["-f", "concat", "-safe", "0", "-i", listFile, "-c:a", "libmp3lame", "-q:a", "2", "-y", outputFile],
+      { timeoutMs: 120000, label: "Concat" },
     );
 
     const outputBuffer = fs.readFileSync(outputFile);
