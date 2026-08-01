@@ -41,13 +41,71 @@ function runFfmpeg(args, { timeoutMs = 120000, label = "ffmpeg" } = {}) {
 }
 // Zero-dependency WebCrypto SigV4 signer (replaces @aws-sdk/@smithy — incident
 // 2026-07-07/08). STS session-token aware. See ./s3-signer.js.
-const { presignS3Url, putS3Object, storageFromEnv, storageFromExplicit } = require("./s3-signer");
+const s3signer = require("./s3-signer");
+const { presignS3Url, putS3Object, storageFromEnv, storageFromExplicit } = s3signer;
 const { routeMixFinal } = require("./mixFinal");
 const { routeMuxVideo } = require("./muxVideo");
 const { routeProxyGen } = require("./proxyGenerator");
 const { routeHlsIngest } = require("./hlsIngest");
 const { routeHashFile } = require("./hashFile");
 const { routeBurnSubtitles } = require("./burnSubtitles");
+
+// ── BOOT-TIME MODULE CONTRACT CHECK (enterprise-grade — SOC 2 CC7.2) ─────────
+// THE universal fix for the class of failure that crash-looped this service on
+// 2026-07-31: proxyGenerator.js was deployed with a NEW import
+// (`createSemaphore` / `putS3ObjectStreaming` from ./s3-signer) while the
+// deployed s3-signer.js was an OLDER copy that did not yet export them. Because
+// plain CommonJS has NO compile step, `require('./s3-signer').createSemaphore`
+// returned `undefined` and only threw `TypeError: createSemaphore is not a
+// function` at RUNTIME, on the live production container, on the first heavy
+// request — a split-deploy that boots straight into a crash loop.
+//
+// This asserts, AT BOOT, that every export the running code depends on actually
+// EXISTS and is the right shape, BEFORE the HTTP server binds. If a required
+// export is missing (a split-deploy where s3-signer.js is stale, a typo'd
+// export, a bad merge), the process logs a LOUD, DIAGNOSTIC fatal naming the
+// exact missing symbol and exits with code 1 — Railway then restarts, sees the
+// same fatal, and the deploy is obviously, immediately broken with a message
+// that says WHY. That is strictly better than a cryptic `is not a function`
+// discovered by a user reporting a stuck proxy. Fail-fast + diagnostic, never a
+// silent runtime landmine.
+//
+// CONTRACT: this is the single source of truth for "what must s3-signer.js
+// export for this build to be internally consistent." Every function this
+// service imports from s3-signer is listed here. Adding a new s3-signer import
+// anywhere in the service means adding it here too — that is the discipline
+// that makes split-deploy drift structurally impossible to reach production
+// silently.
+const REQUIRED_S3SIGNER_EXPORTS = [
+  "presignS3Url",
+  "putS3Object",
+  "putS3ObjectStreaming", // streaming S3 upload — proxyGenerator.js
+  "createSemaphore",      // heavy-lane gate       — proxyGenerator.js
+  "storageFromEnv",
+  "storageFromExplicit",
+];
+
+// Returns { ok, missing[] } — pure, so /health can reuse it without side effects.
+function checkModuleContract() {
+  const missing = REQUIRED_S3SIGNER_EXPORTS.filter(
+    (name) => typeof s3signer[name] !== "function",
+  );
+  return { ok: missing.length === 0, missing };
+}
+
+// Enforce at boot — BEFORE the server binds. A stale/half-matched deploy exits
+// loud instead of crash-looping on the first heavy request.
+{
+  const contract = checkModuleContract();
+  if (!contract.ok) {
+    console.error(
+      `[FATAL] Module contract violation — s3-signer.js is missing required export(s): ${contract.missing.join(", ")}. ` +
+      `This is a SPLIT-DEPLOY: the running code imports symbols the deployed s3-signer.js does not export. ` +
+      `Deploy s3-signer.js + proxyGenerator.js + index.js TOGETHER from the same commit. Exiting.`,
+    );
+    process.exit(1);
+  }
+}
 // Concurrency gate REVERTED 2026-07-31. The bounded-pool gate made heavy
 // synchronous routes (/mix-final, /mux-video, /generate-proxy-sync, etc.) wait
 // SILENTLY in a FIFO queue for up to 10 min when saturated. Every one of those
@@ -73,7 +131,7 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-07-31-proxy-stream-upload-heavy-lane-gate";
+const BUILD_TAG = "extractor-2026-07-31-boot-contract-check";
 
 // ── Non-blocking ffprobe (SOC 2 CC7.2 — never freeze the loop) ──
 // execSync(ffprobe) blocks the single-threaded event loop for the whole probe.
@@ -846,9 +904,21 @@ route(routeBurnSubtitles);
 
 const server = http.createServer(async (req, res) => {
   // /health first — cheapest path, never touches the route table.
+  // Now a TRUE readiness probe, not just a liveness ping: `contract_ok`
+  // re-runs the boot-time module-contract assertion so the worker can refuse
+  // to dispatch to an extractor whose module graph is half-broken (a stale
+  // s3-signer.js). Since the boot check exits(1) on a violation, a running
+  // process always reports contract_ok:true — but surfacing it keeps the field
+  // meaningful for the worker's readiness gate and any future export drift.
   if (req.method === "GET" && req.url === "/health") {
+    const contract = checkModuleContract();
     res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ status: "ok", build_tag: BUILD_TAG }));
+    return res.end(JSON.stringify({
+      status: "ok",
+      build_tag: BUILD_TAG,
+      contract_ok: contract.ok,
+      contract_missing: contract.missing,
+    }));
   }
 
   // ONE dispatch, ONE handler per request. A matched handler owns the response
