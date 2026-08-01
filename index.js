@@ -131,7 +131,7 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-07-31-muxvideo-nonblocking-spawn";
+const BUILD_TAG = "extractor-2026-07-31-extract-decoder-init-hardening";
 
 // ── Non-blocking ffprobe (SOC 2 CC7.2 — never freeze the loop) ──
 // execSync(ffprobe) blocks the single-threaded event loop for the whole probe.
@@ -241,8 +241,27 @@ async function handleExtract(req, res, API_KEY) {
     const concatInputs = valid.map((_, i) => `[a${i}]`).join("");
     const filterGraph = `${filterParts.join(";")};${concatInputs}concat=n=${valid.length}:v=0:a=1[out]`;
 
+    // ── DECODER-INIT HARDENING (2026-07-31) ───────────────────────────────
+    // A speaker with many segments opens MANY inputs at once — one decoder per
+    // -i (a busy speaker = 25+ concurrent FLAC decoders). When several /extract
+    // jobs run simultaneously (a user clicking Clone speaker-to-speaker rapidly,
+    // or a future batch), FFmpeg's per-decoder auto-thread pools race for OS
+    // threads inside the constrained Railway container and fail decoder init
+    // with the errno-EAGAIN message: "Error while opening decoder for input
+    // stream #N:0 : Resource temporarily unavailable". It's intermittent (a
+    // contention race, NOT a bad file) — which is exactly why a retry a moment
+    // later succeeds. `-threads 1` forces SINGLE-THREADED decoder init so every
+    // decoder opens deterministically without competing for a thread pool (the
+    // same fix already proven on the proxy decode path). It is a DECODE-side
+    // flag only — the pcm output is trivial to encode, so this does not slow the
+    // extract. `-fflags +genpts` + `-err_detect ignore_err` tolerate a benign
+    // per-input timestamp/stream quirk so one flaky window can't abort the whole
+    // multi-input concat. SOC 2 CC7.2 — the extract is resilient under concurrency.
     const ffmpegArgs = [
       "-y",
+      "-threads", "1",
+      "-fflags", "+genpts",
+      "-err_detect", "ignore_err",
       ...inputArgs,
       "-filter_complex", filterGraph,
       "-map", "[out]",
