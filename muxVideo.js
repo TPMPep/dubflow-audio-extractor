@@ -36,8 +36,66 @@
 //   → returns the MP4 binary directly (Content-Type: video/mp4) with
 //     X-Mux-Video-Duration-Ms + X-Mux-Audio-Codec response headers.
 
-const { execSync } = require("child_process");
+const { spawn } = require("child_process");
 const fs = require("fs");
+
+// ── Non-blocking ffmpeg/ffprobe runners (SOC 2 CC7.2 — never freeze the loop) ──
+// execSync BLOCKS the single-threaded Node event loop for the ENTIRE FFmpeg run.
+// A feature-length mux therefore stalls EVERY concurrent request on this
+// container — /health included — the "works, then dies after a bit" wedge under
+// 100+ users. spawn() runs the child WITHOUT blocking the loop. runFfmpeg rejects
+// with a truthful error (naming the terminating signal — SIGKILL ⇒ OOM) and the
+// captured stderr tail; a hard timeout SIGKILLs a wedged child. Mirrors the
+// helpers already proven in index.js + mixFinal.js.
+function runFfmpeg(args, { timeoutMs = 25 * 60 * 1000, label = "ffmpeg" } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { child.kill("SIGKILL"); } catch (_) { /* already gone */ }
+      reject(Object.assign(new Error(`${label} timed out after ${Math.round(timeoutMs / 1000)}s`), { kind: "timeout" }));
+    }, timeoutMs);
+    child.stderr.on("data", (d) => { stderr += d.toString(); if (stderr.length > 200000) stderr = stderr.slice(-100000); });
+    child.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(Object.assign(new Error(`${label} spawn failed: ${err.message}`), { kind: "spawn_failed" }));
+    });
+    child.on("close", (code, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code === 0) { resolve(stderr); return; }
+      const tail = stderr.slice(-2000);
+      const oom = signal === "SIGKILL" || signal === "SIGSEGV";
+      const reason = signal ? `killed by ${signal}${oom ? " (likely out of memory)" : ""}` : `exited ${code}`;
+      reject(Object.assign(
+        new Error(`${label} ${reason}`),
+        { kind: oom ? "oom" : "ffmpeg_error", signal, code, stderr_tail: tail },
+      ));
+    });
+  });
+}
+
+// Non-blocking ffprobe. Resolves trimmed stdout; resolves "" on any non-zero
+// exit / spawn error so a failed probe is treated as "unknown duration" (never
+// throws — the mux already succeeded by the time this runs).
+function runFfprobe(args, { timeoutMs = 10000 } = {}) {
+  return new Promise((resolve) => {
+    const child = spawn("ffprobe", args, { stdio: ["ignore", "pipe", "ignore"] });
+    let stdout = "";
+    let settled = false;
+    const done = (val) => { if (settled) return; settled = true; clearTimeout(timer); resolve(val); };
+    const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch (_) { /* gone */ } done(""); }, timeoutMs);
+    child.stdout.on("data", (d) => { stdout += d.toString(); });
+    child.on("error", () => done(""));
+    child.on("close", (code) => done(code === 0 ? stdout.trim() : ""));
+  });
+}
 
 // Route descriptor — registered once in index.js's single route table.
 const routeMuxVideo = { method: "POST", path: "/mux-video", handler: handleMuxVideo };
@@ -118,33 +176,27 @@ async function handleMuxVideo(req, res, API_KEY) {
       outputFile,
     ];
 
-    const quote = (a) => `'${String(a).replace(/'/g, "'\\''")}'`;
-    const cmd = `ffmpeg ${args.map(quote).join(" ")} 2>&1`;
     console.log(`[mux-video] ffmpeg mux (-c:v copy, audio=${audioCodec} ${audioBitrate})`);
 
     const t0 = Date.now();
     try {
-      execSync(cmd, { timeout: 25 * 60 * 1000, maxBuffer: 50 * 1024 * 1024 });
+      await runFfmpeg(args, { label: "mux-video" });
     } catch (err) {
-      const stderrTail = (err.stdout || err.stderr || "").toString().slice(-2000);
+      const stderrTail = err.stderr_tail || err.message || "";
       console.error("[mux-video] ffmpeg failed:", stderrTail);
       try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
       res.writeHead(500, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ error: "ffmpeg mux failed", stderr_tail: stderrTail }));
+      return res.end(JSON.stringify({ error: "ffmpeg mux failed", kind: err.kind || "ffmpeg_error", signal: err.signal || null, stderr_tail: stderrTail }));
     }
 
     // Probe the output duration so the caller can store a truthful length.
+    // Non-blocking + fail-soft: a failed probe → null duration, never a throw.
     let durationMs = null;
-    try {
-      const probe = execSync(
-        `ffprobe -v quiet -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 ${quote(outputFile)}`,
-        { timeout: 10000 }
-      ).toString().trim();
-      const durSec = parseFloat(probe);
-      if (Number.isFinite(durSec) && durSec > 0) durationMs = Math.round(durSec * 1000);
-    } catch (probeErr) {
-      console.warn(`[mux-video] output duration probe failed (non-fatal): ${probeErr.message}`);
-    }
+    const probe = await runFfprobe(
+      ["-v", "quiet", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", outputFile],
+    );
+    const durSec = parseFloat(probe);
+    if (Number.isFinite(durSec) && durSec > 0) durationMs = Math.round(durSec * 1000);
 
     const dt = ((Date.now() - t0) / 1000).toFixed(1);
     const stat = fs.statSync(outputFile);
