@@ -38,7 +38,8 @@ const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const { createSemaphore } = require("./s3-signer");
+const { createSemaphore, putS3ObjectStreaming, storageFromExplicit } = require("./s3-signer");
+const { pipeline } = require("stream/promises");
 
 const LALAL_BASE = "https://www.lalal.ai/api/v1";
 
@@ -192,7 +193,112 @@ async function handleExtractAndUploadLalal(req, res, API_KEY) {
   }
 }
 
-// Route descriptor — registered once in index.js's single route table.
-const routeMeExtractUpload = { method: "POST", path: "/extract-and-upload-lalal", handler: handleExtractAndUploadLalal };
+// =============================================================================
+// POST /download-lalal-to-s3 — the HARVEST-side twin of the fix above.
+// -----------------------------------------------------------------------------
+// THE enterprise fix for M&E HARVEST OOM (2026-08-01). Same root cause as the
+// upload side, on the return trip: once LALAL.AI finishes separation, the Base44
+// pollMEStatus function pulled the ENTIRE finished M&E bed AND vocals stem into
+// the memory-capped Deno function (res.arrayBuffer() → ~500MB EACH for a 44-min
+// lossless FLAC) to re-upload them to S3. On long-form + High(FLAC) it died the
+// same way: "Memory limit would be exceeded before EOF." — AFTER LALAL had
+// already succeeded, so the operator saw "Extraction failed" on a job that
+// actually completed.
+//
+// This route moves the download+upload off the function and onto Railway, which
+// streams each LALAL CDN track through DISK straight to S3 with a bounded
+// footprint (fetch stream → temp file → putS3ObjectStreaming). The stem bytes
+// NEVER live fully in RAM on Base44 OR Railway. pollMEStatus.finalizeME then
+// just writes the DB fields from the returned keys — zero bytes buffered.
+//
+// The caller (pollMEStatus) forwards the project's storage creds (region,
+// bucket, access key, secret, optional STS session token) so the writes land in
+// the project's own regional bucket via storageFromExplicit — identical trust
+// envelope to normalize-voice-sample. SOC 2 CC7.2 / CC8.1.
+// =============================================================================
 
-module.exports = { routeMeExtractUpload };
+// Stream a LALAL CDN URL → local temp file with NO in-memory buffering, then
+// return the temp path + byte size. pipeline() applies proper backpressure so a
+// slow S3 write can never let the CDN read outrun memory.
+async function streamUrlToFile(url, filePath, label) {
+  const dl = await fetch(url);
+  if (!dl.ok || !dl.body) throw new Error(`Failed to download ${label}: HTTP ${dl.status}`);
+  const out = fs.createWriteStream(filePath);
+  await pipeline(dl.body, out);
+  const stat = fs.statSync(filePath);
+  if (stat.size < 1000) throw new Error(`${label} track is degenerate (${stat.size} bytes)`);
+  return stat.size;
+}
+
+async function handleDownloadLalalToS3(req, res, API_KEY) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  let body;
+  try { body = JSON.parse(Buffer.concat(chunks).toString()); }
+  catch { res.writeHead(400); return res.end(JSON.stringify({ error: "bad JSON" })); }
+
+  const authHeader = req.headers["authorization"] || "";
+  const token = authHeader.replace("Bearer ", "");
+  if (token !== API_KEY && body.api_key !== API_KEY) {
+    res.writeHead(401);
+    return res.end(JSON.stringify({ error: "Unauthorized" }));
+  }
+
+  // tracks       — [{ url, key, label }] to stream CDN → S3 (M&E always; vocals
+  //                optional). Each carries its final S3 object key.
+  // content_type — the Content-Type to store both stems with (audio/flac|mpeg).
+  // aws_*        — the project's storage creds (STS-aware) so writes land in the
+  //                project's own regional bucket.
+  const {
+    tracks, content_type,
+    aws_region, target_bucket, aws_access_key_id, aws_secret_access_key, aws_session_token, endpoint,
+  } = body;
+  if (!Array.isArray(tracks) || tracks.length === 0 || !target_bucket || !aws_access_key_id || !aws_secret_access_key) {
+    res.writeHead(400);
+    return res.end(JSON.stringify({ error: "tracks[], target_bucket, aws_access_key_id, aws_secret_access_key required" }));
+  }
+
+  if (!ME_SEMAPHORE.tryAcquire()) {
+    res.writeHead(503, { "Content-Type": "application/json", "Retry-After": "30" });
+    return res.end(JSON.stringify({ error: "me_lane_busy", retryable: true, message: `M&E lane full (${ME_SEMAPHORE.inUse()}/${ME_SEMAPHORE.max}). Retry shortly.` }));
+  }
+
+  const storage = storageFromExplicit({
+    region: aws_region, bucket: target_bucket,
+    accessKeyId: aws_access_key_id, secretAccessKey: aws_secret_access_key,
+    sessionToken: aws_session_token, endpoint: endpoint || null,
+  });
+
+  let tmpDir = null;
+  try {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "me-harvest-"));
+    const uploaded = [];
+    for (const t of tracks) {
+      if (!t?.url || !t?.key) throw new Error("each track needs { url, key }");
+      const label = t.label || "track";
+      const filePath = path.join(tmpDir, `${label}.bin`);
+      const size = await streamUrlToFile(t.url, filePath, label);
+      await putS3ObjectStreaming(storage, t.key, filePath, { contentType: content_type });
+      console.log(`[download-lalal-to-s3] ${label}: ${(size / 1024 / 1024).toFixed(1)}MB → ${t.key}`);
+      uploaded.push({ label, key: t.key, size_bytes: size });
+      // Free disk between stems so two large FLAC stems never co-reside.
+      try { fs.rmSync(filePath, { force: true }); } catch (_) { /* best effort */ }
+    }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ success: true, uploaded }));
+  } catch (err) {
+    console.error("[download-lalal-to-s3] error:", err.message);
+    try { if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) { /* best effort */ }
+    res.writeHead(500, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ error: err.message }));
+  } finally {
+    ME_SEMAPHORE.release();
+  }
+}
+
+// Route descriptors — registered once in index.js's single route table.
+const routeMeExtractUpload = { method: "POST", path: "/extract-and-upload-lalal", handler: handleExtractAndUploadLalal };
+const routeMeDownloadToS3 = { method: "POST", path: "/download-lalal-to-s3", handler: handleDownloadLalalToS3 };
+
+module.exports = { routeMeExtractUpload, routeMeDownloadToS3 };
