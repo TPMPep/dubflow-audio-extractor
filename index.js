@@ -49,7 +49,7 @@ const { routeProxyGen } = require("./proxyGenerator");
 const { routeHlsIngest } = require("./hlsIngest");
 const { routeHashFile } = require("./hashFile");
 const { routeBurnSubtitles } = require("./burnSubtitles");
-const { routeMeExtractUpload } = require("./meExtractUpload");
+const { routeMeExtractUpload, routeMeDownloadToS3 } = require("./meExtractUpload");
 
 // ── BOOT-TIME MODULE CONTRACT CHECK (enterprise-grade — SOC 2 CC7.2) ─────────
 // THE universal fix for the class of failure that crash-looped this service on
@@ -132,7 +132,7 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-08-01-me-extract-upload-streaming";
+const BUILD_TAG = "extractor-2026-08-01-me-harvest-streaming";
 
 // ── Non-blocking ffprobe (SOC 2 CC7.2 — never freeze the loop) ──
 // execSync(ffprobe) blocks the single-threaded event loop for the whole probe.
@@ -922,6 +922,7 @@ route(routeHlsIngest);
 route(routeHashFile);
 route(routeBurnSubtitles);
 route(routeMeExtractUpload);
+route(routeMeDownloadToS3);
 
 const server = http.createServer(async (req, res) => {
   // /health first — cheapest path, never touches the route table.
