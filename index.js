@@ -132,7 +132,7 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-08-07-dialogue-tail-level-guard";
+const BUILD_TAG = "extractor-2026-08-07-unique-temp-workspaces";
 
 // ── Non-blocking ffprobe (SOC 2 CC7.2 — never freeze the loop) ──
 // execSync(ffprobe) blocks the single-threaded event loop for the whole probe.
@@ -205,8 +205,7 @@ async function handleExtract(req, res, API_KEY) {
 
     const signedUrl = await presignS3Url({ method: "GET", storage, key: s3_key, expiresIn: 3600 });
 
-    const tmpDir = `/tmp/${Date.now()}`;
-    fs.mkdirSync(tmpDir, { recursive: true });
+    const tmpDir = fs.mkdtempSync('/tmp/extract_');
     const outputFile = `${tmpDir}/output.wav`;
 
     // ── DOWNLOAD-ONCE, THEN LOCAL MULTI-WINDOW EXTRACT (enterprise-grade) ──
@@ -378,8 +377,7 @@ async function handleTimeStretch(req, res, API_KEY) {
   const meanCeilingDb = -14;
   const peakCeilingDb = -1.5;
 
-  const tmpDir = `/tmp/stretch_${Date.now()}`;
-  fs.mkdirSync(tmpDir, { recursive: true });
+  const tmpDir = fs.mkdtempSync('/tmp/stretch_');
   // Extension-less input — ffmpeg content-probes the real container (the
   // lossless pipeline sends WAV; legacy clips are MP3). Never let a wrong
   // extension steer the demuxer.
@@ -531,8 +529,7 @@ async function handleProcess(req, res, API_KEY) {
     return res.end(JSON.stringify({ error: "source_url and filters required" }));
   }
 
-  const tmpDir = `/tmp/process_${Date.now()}`;
-  fs.mkdirSync(tmpDir, { recursive: true });
+  const tmpDir = fs.mkdtempSync('/tmp/process_');
   const inputFile = `${tmpDir}/input`;
   const outputFile = `${tmpDir}/output.${output_format}`;
 
@@ -670,8 +667,7 @@ async function handleTrim(req, res, API_KEY) {
     return res.end(JSON.stringify({ error: "end_ms must be greater than start_ms" }));
   }
 
-  const tmpDir = `/tmp/trim_${Date.now()}`;
-  fs.mkdirSync(tmpDir, { recursive: true });
+  const tmpDir = fs.mkdtempSync('/tmp/trim_');
   const inputFile = `${tmpDir}/input`;
   const outputFile = `${tmpDir}/output.${output_format}`;
 
@@ -751,8 +747,7 @@ async function handleSilenceDetect(req, res, API_KEY) {
     return res.end(JSON.stringify({ error: "audio_url required" }));
   }
 
-  const tmpDir = `/tmp/silence_${Date.now()}`;
-  fs.mkdirSync(tmpDir, { recursive: true });
+  const tmpDir = fs.mkdtempSync('/tmp/silence_');
   const inputFile = `${tmpDir}/input`;
 
   try {
@@ -866,8 +861,7 @@ async function handleNormalizeVoiceSample(req, res, API_KEY) {
     return res.end(JSON.stringify({ error: "source_signed_url, target_bucket, target_key required" }));
   }
 
-  const tmpDir = `/tmp/normalize_${Date.now()}`;
-  fs.mkdirSync(tmpDir, { recursive: true });
+  const tmpDir = fs.mkdtempSync('/tmp/normalize_');
   const inputFile = `${tmpDir}/input`;
   const outputFile = `${tmpDir}/output.wav`;
 
@@ -942,8 +936,7 @@ async function handleConcat(req, res, API_KEY) {
     return res.end(JSON.stringify({ error: "audio_urls array required" }));
   }
 
-  const tmpDir = `/tmp/concat_${Date.now()}`;
-  fs.mkdirSync(tmpDir, { recursive: true });
+  const tmpDir = fs.mkdtempSync('/tmp/concat_');
 
   try {
     console.log(`[concat] Concatenating ${audio_urls.length} files`);
