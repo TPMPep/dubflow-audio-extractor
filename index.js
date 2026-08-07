@@ -132,7 +132,7 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-08-01-extract-download-once";
+const BUILD_TAG = "extractor-2026-08-07-exact-timed-audio-fit";
 
 // ── Non-blocking ffprobe (SOC 2 CC7.2 — never freeze the loop) ──
 // execSync(ffprobe) blocks the single-threaded event loop for the whole probe.
@@ -406,6 +406,13 @@ async function handleTimeStretch(req, res, API_KEY) {
       remaining /= 0.5;
     }
     filters.push(`atempo=${remaining.toFixed(6)}`);
+    // Materialize an exact sample-bounded output. atempo can finish a few
+    // samples either side of the requested duration; apad+atrim normalizes that
+    // technical residue without truncating content (the ratio above already
+    // compresses the complete source performance into the target window).
+    filters.push(`apad=pad_dur=${target_duration_sec.toFixed(6)}`);
+    filters.push(`atrim=duration=${target_duration_sec.toFixed(6)}`);
+    filters.push('asetpts=N/SR/TB');
 
     // Append micro-fades AFTER the atempo chain so the fade durations are in
     // real output-time seconds (atempo changes duration; fades must measure
