@@ -34,7 +34,7 @@ function runFfmpeg(args, { timeoutMs = 120000, label = "ffmpeg" } = {}) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (code === 0) resolve();
+      if (code === 0) resolve(stderr);
       else reject(new Error(`${label} exited ${code}: ${stderr.slice(-500)}`));
     });
   });
@@ -132,7 +132,7 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-08-07-exact-timed-audio-fit";
+const BUILD_TAG = "extractor-2026-08-07-dialogue-tail-level-guard";
 
 // ── Non-blocking ffprobe (SOC 2 CC7.2 — never freeze the loop) ──
 // execSync(ffprobe) blocks the single-threaded event loop for the whole probe.
@@ -348,6 +348,11 @@ async function handleTimeStretch(req, res, API_KEY) {
   // "wav" (lossless pipeline — pcm_s16le, no generational re-encode loss).
   const { audio_url, target_duration_sec, output_format = "mp3" } = body;
   const tsOutFmt = output_format === "wav" ? "wav" : "mp3";
+  // Untimed TTS may append a short, measured silence guard AFTER the natural
+  // take. The dialogue itself stays at its natural duration; only the final
+  // container grows, so later lines move rather than clipping this one.
+  const tailPadMs = Math.max(0, Math.min(250, Number(body.tail_pad_ms || 0)));
+  const tailPadSec = tailPadMs / 1000;
   if (!audio_url || !target_duration_sec) {
     res.writeHead(400);
     return res.end(JSON.stringify({ error: "audio_url and target_duration_sec required" }));
@@ -366,6 +371,12 @@ async function handleTimeStretch(req, res, API_KEY) {
   // Fades are tri (linear) curves — phase-neutral, no DC offset.
   const fadeInSec = Math.max(0, Number(body.fade_in_ms ?? 8)) / 1000;
   const fadeOutSec = Math.max(0, Number(body.fade_out_ms ?? 12)) / 1000;
+  // Attenuation-only dialogue leveling: never boosts quiet/intentional reads.
+  // A clip is reduced only when its measured mean exceeds -14 dBFS or its
+  // sample peak exceeds -1.5 dBFS. This preserves performance dynamics while
+  // preventing unusually hot provider takes from passing through unchanged.
+  const meanCeilingDb = -14;
+  const peakCeilingDb = -1.5;
 
   const tmpDir = `/tmp/stretch_${Date.now()}`;
   fs.mkdirSync(tmpDir, { recursive: true });
@@ -393,7 +404,25 @@ async function handleTimeStretch(req, res, API_KEY) {
     }
 
     const ratio = originalDuration / target_duration_sec;
-    console.log(`Original: ${originalDuration.toFixed(2)}s, Target: ${target_duration_sec}s, Ratio: ${ratio.toFixed(3)}`);
+    const finalDurationSec = target_duration_sec + tailPadSec;
+    console.log(`Original: ${originalDuration.toFixed(2)}s, Content target: ${target_duration_sec}s, Final: ${finalDurationSec}s, Ratio: ${ratio.toFixed(3)}`);
+
+    // Measure the provider take before changing it. volumedetect is one bounded
+    // local pass over a short WAV; it gives deterministic sample peak + mean
+    // level without sending customer audio anywhere else.
+    const volumeReport = await runFfmpeg(
+      ["-hide_banner", "-nostdin", "-i", inputFile, "-af", "volumedetect", "-f", "null", "-"],
+      { timeoutMs: 30000, label: "Level analysis" },
+    );
+    const parseVolume = (name) => {
+      const match = String(volumeReport || "").match(new RegExp(`${name}:\\s*(-?[0-9.]+)\\s*dB`, "i"));
+      return match ? Number(match[1]) : null;
+    };
+    const inputPeakDb = parseVolume("max_volume");
+    const inputMeanDb = parseVolume("mean_volume");
+    const peakAttenuation = Number.isFinite(inputPeakDb) ? peakCeilingDb - inputPeakDb : 0;
+    const meanAttenuation = Number.isFinite(inputMeanDb) ? meanCeilingDb - inputMeanDb : 0;
+    const appliedGainDb = Math.min(0, peakAttenuation, meanAttenuation);
 
     const filters = [];
     let remaining = ratio;
@@ -406,25 +435,30 @@ async function handleTimeStretch(req, res, API_KEY) {
       remaining /= 0.5;
     }
     filters.push(`atempo=${remaining.toFixed(6)}`);
-    // Materialize an exact sample-bounded output. atempo can finish a few
-    // samples either side of the requested duration; apad+atrim normalizes that
-    // technical residue without truncating content (the ratio above already
-    // compresses the complete source performance into the target window).
+    // First materialize the COMPLETE performance at its content duration.
     filters.push(`apad=pad_dur=${target_duration_sec.toFixed(6)}`);
     filters.push(`atrim=duration=${target_duration_sec.toFixed(6)}`);
     filters.push('asetpts=N/SR/TB');
 
-    // Append micro-fades AFTER the atempo chain so the fade durations are in
-    // real output-time seconds (atempo changes duration; fades must measure
-    // against the final timeline). The fade-out start is computed from the
-    // TARGET duration since that's the post-stretch length. Guard against
-    // degenerate windows shorter than the fades themselves.
+    // Edge fades apply to the spoken content. Untimed TTS uses a shorter 3ms
+    // tail fade plus a 40ms silence guard, so a provider take that reaches its
+    // final sample is de-clicked without audibly swallowing the last phoneme.
     const fadeOutStartSec = Math.max(0, target_duration_sec - fadeOutSec);
     if (fadeInSec > 0 && target_duration_sec > fadeInSec * 2) {
       filters.push(`afade=t=in:st=0:d=${fadeInSec.toFixed(4)}:curve=tri`);
     }
     if (fadeOutSec > 0 && target_duration_sec > fadeOutSec * 2) {
       filters.push(`afade=t=out:st=${fadeOutStartSec.toFixed(4)}:d=${fadeOutSec.toFixed(4)}:curve=tri`);
+    }
+    if (appliedGainDb < -0.01) filters.push(`volume=${appliedGainDb.toFixed(2)}dB`);
+
+    // Append the tail guard AFTER the content fade. No tempo change is applied
+    // to this silence; the final measured duration expands and drives TTS
+    // sequencing, so every later line moves forward by the exact guard amount.
+    if (tailPadSec > 0) {
+      filters.push(`apad=pad_dur=${finalDurationSec.toFixed(6)}`);
+      filters.push(`atrim=duration=${finalDurationSec.toFixed(6)}`);
+      filters.push('asetpts=N/SR/TB');
     }
     const filterStr = filters.join(",");
 
@@ -448,7 +482,12 @@ async function handleTimeStretch(req, res, API_KEY) {
     // callers that ignore them. ffprobe on the output must NEVER fail the
     // (already-successful) audio response: a probe error degrades the
     // output-duration header to absent, not the whole request.
-    const durationHeaders = {};
+    const durationHeaders = {
+      "X-Applied-Gain-Db": appliedGainDb.toFixed(2),
+      "X-Tail-Pad-Ms": String(Math.round(tailPadMs)),
+    };
+    if (Number.isFinite(inputPeakDb)) durationHeaders["X-Input-Peak-Dbfs"] = inputPeakDb.toFixed(2);
+    if (Number.isFinite(inputMeanDb)) durationHeaders["X-Input-Mean-Dbfs"] = inputMeanDb.toFixed(2);
     if (Number.isFinite(originalDuration) && originalDuration > 0) {
       durationHeaders["X-Input-Duration-Ms"] = String(Math.round(originalDuration * 1000));
     }
