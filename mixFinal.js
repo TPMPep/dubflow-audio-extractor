@@ -29,6 +29,8 @@
 // standard for broadcast and streaming deliverables (Netflix, Apple TV+, EBU, BBC).
 
 const { spawn } = require("child_process");
+const { Readable } = require("stream");
+const { pipeline } = require("stream/promises");
 const fs = require("fs");
 
 // Max clips summed in a single intermediate FFmpeg pass. Keeps peak memory
@@ -36,7 +38,8 @@ const fs = require("fs");
 // Railway dyno (each pass decodes ≤80 short clips + a silent base, never the
 // whole program-length apad fan-out the old design built). Tunable via the
 // MIX_BATCH_SIZE env var without a code change.
-const BATCH_SIZE = Math.max(10, Math.min(200, Number(process.env.MIX_BATCH_SIZE) || 80));
+const BATCH_SIZE = Math.max(10, Math.min(80, Number(process.env.MIX_BATCH_SIZE) || 32));
+const DOWNLOAD_CONCURRENCY = Math.max(4, Math.min(32, Number(process.env.MIX_DOWNLOAD_CONCURRENCY) || 16));
 
 // Non-blocking ffmpeg runner. Rejects with a TRUTHFUL error that names the
 // terminating signal (SIGKILL ⇒ almost always OOM on a big graph) and the last
@@ -120,19 +123,16 @@ function buildClipChain(c, inIdx, outLabel, sampleRate, fadeInSec, fadeOutSec) {
   );
 }
 
-// Mix one batch of positioned clips into a single TC-locked intermediate WAV at
-// the FULL program duration. The intermediate carries every clip already at its
-// absolute timeline offset (adelay), so the final pass simply sums the
-// intermediates with no further positioning. amix=duration=first clamps to the
-// silent base (= program length). normalize=0 preserves levels (we sum, never
-// average). 32-bit float PCM intermediates avoid any quantization loss across
-// the two mix stages.
+// Mix one consecutive batch into a timeline-local intermediate WAV. The caller
+// rebases clip offsets to this span and records the span's absolute start; the
+// final pass delays the compact intermediate back into place. normalize=0
+// preserves levels, and 32-bit float avoids intermediate quantization loss.
 async function mixBatch(clips, durationSec, sampleRate, fadeInSec, fadeOutSec, outFile) {
   const args = ["-y", "-hide_banner", "-loglevel", "warning", "-nostdin"];
   // Silent base = program length. duration=first clamps the batch to it.
   args.push("-f", "lavfi", "-t", String(durationSec),
     "-i", `anullsrc=channel_layout=stereo:sample_rate=${sampleRate}`);
-  for (const c of clips) args.push("-i", c.url);
+  for (const c of clips) args.push("-i", c.local_path || c.url);
 
   const filterParts = [`[0:a]aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo[base]`];
   const mixLabels = ["[base]"];
@@ -151,6 +151,37 @@ async function mixBatch(clips, durationSec, sampleRate, fadeInSec, fadeOutSec, o
 
   await runFfmpeg(args, { label: `mix-batch(${clips.length} clips)` });
   try { fs.unlinkSync(filterFile); } catch (_) { /* best effort */ }
+}
+
+async function downloadToFile(url, filePath, label) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 120000);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    if (!response.ok || !response.body) throw new Error(`${label} download failed (${response.status})`);
+    await pipeline(Readable.fromWeb(response.body), fs.createWriteStream(filePath));
+    const size = fs.statSync(filePath).size;
+    if (size < 44) throw new Error(`${label} download produced an invalid ${size}-byte file`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function localizeClips(clips, tmpDir) {
+  const localized = new Array(clips.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(DOWNLOAD_CONCURRENCY, clips.length) }, async () => {
+    while (true) {
+      const index = cursor++;
+      if (index >= clips.length) return;
+      const filePath = `${tmpDir}/clip_${String(index).padStart(5, "0")}`;
+      await downloadToFile(clips[index].url, filePath, `clip ${index + 1}`);
+      localized[index] = { ...clips[index], local_path: filePath };
+      if ((index + 1) % 100 === 0) console.log(`[mix-final] localized ${index + 1}/${clips.length} clips`);
+    }
+  });
+  await Promise.all(workers);
+  return localized;
 }
 
 async function handleMixFinal(req, res, API_KEY) {
@@ -226,40 +257,50 @@ async function handleMixFinal(req, res, API_KEY) {
   const fadeOutSec = fadeOutMs / 1000;
 
   try {
-    const batchCount = Math.ceil(clips.length / BATCH_SIZE);
-    console.log(`[mix-final] ${clips.length} clips in ${batchCount} batch(es) of ≤${BATCH_SIZE}, me=${!!meTrack}, vocals=${!!vocalsTrack}, dur=${durationMs}ms, fmt=${outputFormat}, sr=${sampleRate}, loudnorm=${loudnessTargetLufs ?? "off"}`);
+    const orderedClips = [...clips].sort((a, b) => Number(a.start_ms) - Number(b.start_ms));
+    const batchCount = Math.ceil(orderedClips.length / BATCH_SIZE);
+    console.log(`[mix-final] ${orderedClips.length} clips in ${batchCount} batch(es) of ≤${BATCH_SIZE}, downloads≤${DOWNLOAD_CONCURRENCY}, me=${!!meTrack}, vocals=${!!vocalsTrack}, dur=${durationMs}ms, fmt=${outputFormat}, sr=${sampleRate}, loudnorm=${loudnessTargetLufs ?? "off"}`);
 
     const t0 = Date.now();
+    const localClips = await localizeClips(orderedClips, tmpDir);
+    console.log(`[mix-final] localized ${localClips.length} clips in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
 
-    // ── STAGE 1: mix clips in bounded batches → intermediate TC-locked stems ──
-    // Each intermediate is the full program length with its batch's clips
-    // already at their absolute offsets. Peak memory is bounded by BATCH_SIZE.
+    // ── STAGE 1: bounded, timeline-local intermediate stems ──────────────
+    // Each batch contains consecutive clips and renders only its own timeline
+    // span—not the full program. Across all batches, intermediate duration is
+    // approximately one program instead of batchCount × program duration.
     const intermediates = [];
     for (let b = 0; b < batchCount; b++) {
-      const batch = clips.slice(b * BATCH_SIZE, (b + 1) * BATCH_SIZE);
+      const from = b * BATCH_SIZE;
+      const to = Math.min(localClips.length, (b + 1) * BATCH_SIZE);
+      const batch = localClips.slice(from, to);
+      const batchStartMs = Math.max(0, Number(batch[0].start_ms) || 0);
+      const nextStartMs = to < localClips.length ? Number(localClips[to].start_ms) : durationMs;
+      const batchEndMs = Math.max(batchStartMs + 1, Math.min(durationMs, Number.isFinite(nextStartMs) ? nextStartMs : durationMs));
+      const localBatch = batch.map((clip) => ({ ...clip, start_ms: Math.max(0, Number(clip.start_ms) - batchStartMs) }));
       const interFile = `${tmpDir}/inter_${b}.wav`;
-      await mixBatch(batch, durationSec, sampleRate, fadeInSec, fadeOutSec, interFile);
-      intermediates.push(interFile);
+      await mixBatch(localBatch, (batchEndMs - batchStartMs) / 1000, sampleRate, fadeInSec, fadeOutSec, interFile);
+      intermediates.push({ file: interFile, start_ms: batchStartMs });
     }
-    console.log(`[mix-final] stage 1 done: ${intermediates.length} intermediate stem(s) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    console.log(`[mix-final] stage 1 done: ${intermediates.length} span-local stem(s) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
 
-    // ── STAGE 2: sum intermediate stems + M&E + vocals → final program ──
-    // Every input here is already TC-locked at program length, so the final
-    // pass is a pure sum (no positioning). With a single batch and no beds this
-    // is just a format+trim of the one intermediate. Loudnorm (when requested)
-    // runs once on the summed program — identical to the legacy behavior.
+    // ── STAGE 2: position compact stems + M&E + vocals → final program ──
+    // One full-program silent base clamps duration; each compact stem is delayed
+    // to its audited absolute offset. Loudnorm runs once after the final sum.
     const args2 = ["-y", "-hide_banner", "-loglevel", "warning", "-nostdin"];
-    for (const f of intermediates) args2.push("-i", f);
+    args2.push("-f", "lavfi", "-t", String(durationSec), "-i", `anullsrc=channel_layout=stereo:sample_rate=${sampleRate}`);
+    for (const item of intermediates) args2.push("-i", item.file);
     if (meTrack) args2.push("-i", meTrack.url);
     if (vocalsTrack) args2.push("-i", vocalsTrack.url);
 
-    const filter2 = [];
-    const sumLabels = [];
+    const filter2 = [`[0:a]aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo[base]`];
+    const sumLabels = ["[base]"];
     for (let i = 0; i < intermediates.length; i++) {
-      filter2.push(`[${i}:a]aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo[s${i}]`);
+      const delay = Math.max(0, Math.round(intermediates[i].start_ms));
+      filter2.push(`[${i + 1}:a]aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo,adelay=${delay}|${delay},apad[s${i}]`);
       sumLabels.push(`[s${i}]`);
     }
-    let nextIdx = intermediates.length;
+    let nextIdx = intermediates.length + 1;
     if (meTrack) {
       const meGain = Number(meTrack.gain_db ?? -6);
       filter2.push(`[${nextIdx}:a]aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo,volume=${meGain}dB[me]`);
@@ -297,8 +338,8 @@ async function handleMixFinal(req, res, API_KEY) {
 
     const ffmpegStderr = await runFfmpeg(args2, { label: "mix-final" });
 
-    // Free intermediates ASAP (each is a full-program-length float WAV).
-    for (const f of intermediates) { try { fs.unlinkSync(f); } catch (_) { /* best effort */ } }
+    // Free span-local intermediates ASAP.
+    for (const item of intermediates) { try { fs.unlinkSync(item.file); } catch (_) { /* best effort */ } }
 
     // Log the loudnorm measured summary for auditor evidence (Railway logs).
     if (loudnessTargetLufs != null && ffmpegStderr) {
@@ -312,22 +353,24 @@ async function handleMixFinal(req, res, API_KEY) {
     const stat = fs.statSync(outputFile);
     console.log(`[mix-final] OK in ${dt}s, ${(stat.size / 1024 / 1024).toFixed(2)}MB`);
 
-    const outputBuffer = fs.readFileSync(outputFile);
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-
     const mime = outputFormat === "wav" ? "audio/wav"
       : outputFormat === "flac" ? "audio/flac"
       : outputFormat === "mp3" ? "audio/mpeg"
       : "audio/aac";
     res.writeHead(200, {
       "Content-Type": mime,
-      "Content-Length": outputBuffer.length,
+      "Content-Length": stat.size,
       "X-Mix-Duration-Ms": String(durationMs),
       "X-Mix-Clip-Count": String(clips.length),
       "X-Mix-Batch-Count": String(intermediates.length),
       "X-Mix-Loudness-Target-Lufs": loudnessTargetLufs != null ? String(loudnessTargetLufs) : "off",
     });
-    return res.end(outputBuffer);
+    const outputStream = fs.createReadStream(outputFile);
+    outputStream.pipe(res);
+    return await new Promise((resolve, reject) => {
+      res.on("finish", () => { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {} resolve(); });
+      outputStream.on("error", reject);
+    });
 
   } catch (err) {
     // TRUTHFUL failure (2026-06-26): when ffmpeg is OOM-killed the empty stderr
