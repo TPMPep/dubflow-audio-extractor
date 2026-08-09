@@ -132,7 +132,7 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-08-07-unique-temp-workspaces";
+const BUILD_TAG = "extractor-2026-08-09-segment-delivery-profile";
 
 // ── Non-blocking ffprobe (SOC 2 CC7.2 — never freeze the loop) ──
 // execSync(ffprobe) blocks the single-threaded event loop for the whole probe.
@@ -438,9 +438,10 @@ async function handleTimeStretch(req, res, API_KEY) {
     filters.push(`atrim=duration=${target_duration_sec.toFixed(6)}`);
     filters.push('asetpts=N/SR/TB');
 
-    // Edge fades apply to the spoken content. Untimed TTS uses a shorter 3ms
-    // tail fade plus a 40ms silence guard, so a provider take that reaches its
-    // final sample is de-clicked without audibly swallowing the last phoneme.
+    // Edge fades apply to the spoken content. Untimed TTS callers use the
+    // studio 12ms tail fade plus a 60ms silence guard, so a provider take that
+    // reaches its final sample decays smoothly to zero without audibly
+    // swallowing the last phoneme.
     const fadeOutStartSec = Math.max(0, target_duration_sec - fadeOutSec);
     if (fadeInSec > 0 && target_duration_sec > fadeInSec * 2) {
       filters.push(`afade=t=in:st=0:d=${fadeInSec.toFixed(4)}:curve=tri`);
@@ -523,10 +524,10 @@ async function handleProcess(req, res, API_KEY) {
     return res.end(JSON.stringify({ error: "Unauthorized" }));
   }
 
-  const { source_url, filters, output_format = "mp3", extra_args = "" } = body;
-  if (!source_url || !filters) {
+  const { source_url, filters, output_format = "mp3", extra_args = "", delivery_profile = null } = body;
+  if (!source_url || !filters || !["wav", "flac", "mp3"].includes(output_format)) {
     res.writeHead(400);
-    return res.end(JSON.stringify({ error: "source_url and filters required" }));
+    return res.end(JSON.stringify({ error: "source_url, filters, and a valid output_format are required" }));
   }
 
   const tmpDir = fs.mkdtempSync('/tmp/process_');
@@ -585,11 +586,17 @@ async function handleProcess(req, res, API_KEY) {
     //   wav  → pcm_s16le (lossless identity-shift path)
     //   flac → native FLAC (lossless M&E High-fidelity source extract)
     //   else → lame MP3 (default)
-    const procCodecArgs = output_format === "wav"
-      ? "-c:a pcm_s16le"
-      : output_format === "flac"
-        ? "-c:a flac"
-        : "-c:a libmp3lame -q:a 2";
+    const procCodecArgs = delivery_profile === "segment_export"
+      ? (output_format === "wav"
+        ? "-c:a pcm_s24le -ar 48000"
+        : output_format === "flac"
+          ? "-c:a flac -compression_level 8 -ar 48000"
+          : "-c:a libmp3lame -b:a 320k -ar 48000")
+      : (output_format === "wav"
+        ? "-c:a pcm_s16le"
+        : output_format === "flac"
+          ? "-c:a flac"
+          : "-c:a libmp3lame -q:a 2");
     // Build the arg array (spawn — non-blocking). inputFlags go before -i,
     // outputFlags + codec after. procCodecArgs is a string pair we split.
     const procArgs = [
@@ -622,7 +629,8 @@ async function handleProcess(req, res, API_KEY) {
     }
 
     fs.rmSync(tmpDir, { recursive: true, force: true });
-    res.writeHead(200, { "Content-Type": `audio/${output_format}`, ...processDurationHeaders });
+    const processContentType = output_format === "mp3" ? "audio/mpeg" : `audio/${output_format}`;
+    res.writeHead(200, { "Content-Type": processContentType, ...processDurationHeaders });
     res.end(outputBuffer);
   } catch (err) {
     console.error("[process] Error:", err.message);
