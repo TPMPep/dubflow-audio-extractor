@@ -94,7 +94,18 @@ const routeMixFinal = { method: "POST", path: "/mix-final", handler: handleMixFi
 // truth for render parity.
 function buildClipChain(c, inIdx, outLabel, sampleRate, fadeInSec, fadeOutSec) {
   const delay = Math.max(0, Math.round(Number(c.start_ms)));
-  const gainDb = Number(c.gain_db) || 0;
+  const placement = c.scene_placement && c.scene_placement.preset_key !== 'clean' && c.scene_placement.recipe ? c.scene_placement.recipe : null;
+  const gainDb = (Number(c.gain_db) || 0) + (Number(placement?.gain_db) || 0);
+  const hp = Math.max(20, Math.min(1200, Number(placement?.highpass_hz) || 60));
+  const lp = Math.max(1200, Math.min(20000, Number(placement?.lowpass_hz) || 20000));
+  const compression = Math.max(0, Math.min(1, Number(placement?.compression) || 0));
+  const room = Math.max(0, Math.min(0.65, Number(placement?.room_mix) || 0));
+  const echoDelay = Math.max(15, Math.min(250, Number(placement?.echo_delay_ms) || 60));
+  const echoFeedback = Math.max(0, Math.min(0.65, Number(placement?.echo_feedback) || 0));
+  const pan = Math.max(-1, Math.min(1, Number(placement?.pan) || 0));
+  const placementPart = placement
+    ? `highpass=f=${hp.toFixed(1)},lowpass=f=${lp.toFixed(1)},${compression > 0 ? `acompressor=threshold=0.1259:ratio=${(1 + compression * 11).toFixed(2)},` : ''}${room > 0 ? `aecho=1:1:${echoDelay.toFixed(1)}:${Math.max(0.01, room * Math.max(0.05, echoFeedback)).toFixed(3)},` : ''}${Math.abs(pan) > 0.001 ? `pan=stereo|c0=${(pan <= 0 ? 1 : 1 - pan).toFixed(3)}*c0|c1=${(pan >= 0 ? 1 : 1 + pan).toFixed(3)}*c1,` : ''}`
+    : '';
 
   const rate = Number(c.playback_rate);
   const tempoPart = (Number.isFinite(rate) && rate > 0 && Math.abs(rate - 1) > 0.001)
@@ -116,6 +127,7 @@ function buildClipChain(c, inIdx, outLabel, sampleRate, fadeInSec, fadeOutSec) {
     trimPart +
     fadeInPart +
     fadeOutPart +
+    placementPart +
     (gainDb !== 0 ? `volume=${gainDb}dB,` : "") +
     `adelay=${delay}|${delay},` +
     `apad` +
@@ -276,7 +288,10 @@ async function handleMixFinal(req, res, API_KEY) {
       const batch = localClips.slice(from, to);
       const batchStartMs = Math.max(0, Number(batch[0].start_ms) || 0);
       const nextStartMs = to < localClips.length ? Number(localClips[to].start_ms) : durationMs;
-      const batchEndMs = Math.max(batchStartMs + 1, Math.min(durationMs, Number.isFinite(nextStartMs) ? nextStartMs : durationMs));
+      // Preserve up to 300ms of acoustic tail across batch boundaries so a
+      // hallway/room echo never changes merely because it landed at batch N.
+      const spanEndMs = Number.isFinite(nextStartMs) ? nextStartMs + (to < localClips.length ? 300 : 0) : durationMs;
+      const batchEndMs = Math.max(batchStartMs + 1, Math.min(durationMs, spanEndMs));
       const localBatch = batch.map((clip) => ({ ...clip, start_ms: Math.max(0, Number(clip.start_ms) - batchStartMs) }));
       const interFile = `${tmpDir}/inter_${b}.wav`;
       await mixBatch(localBatch, (batchEndMs - batchStartMs) / 1000, sampleRate, fadeInSec, fadeOutSec, interFile);
