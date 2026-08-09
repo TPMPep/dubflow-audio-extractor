@@ -37,6 +37,8 @@
 //     X-Mux-Video-Duration-Ms + X-Mux-Audio-Codec response headers.
 
 const { spawn } = require("child_process");
+const { Readable } = require("stream");
+const { pipeline } = require("stream/promises");
 const fs = require("fs");
 
 // ── Non-blocking ffmpeg/ffprobe runners (SOC 2 CC7.2 — never freeze the loop) ──
@@ -145,12 +147,15 @@ async function handleMuxVideo(req, res, API_KEY) {
     // Download both inputs to local tmp so ffmpeg seeks deterministically
     // (streaming a signed URL directly into ffmpeg can stall on large media).
     const [vRes, aRes] = await Promise.all([fetch(videoUrl), fetch(audioUrl)]);
-    if (!vRes.ok) throw new Error(`video download failed: ${vRes.status}`);
-    if (!aRes.ok) throw new Error(`audio download failed: ${aRes.status}`);
-    const [vBuf, aBuf] = await Promise.all([vRes.arrayBuffer(), aRes.arrayBuffer()]);
-    fs.writeFileSync(videoFile, Buffer.from(vBuf));
-    fs.writeFileSync(audioFile, Buffer.from(aBuf));
-    console.log(`[mux-video] video=${(vBuf.byteLength / 1024 / 1024).toFixed(1)}MB audio=${(aBuf.byteLength / 1024 / 1024).toFixed(1)}MB`);
+    if (!vRes.ok || !vRes.body) throw new Error(`video download failed: ${vRes.status}`);
+    if (!aRes.ok || !aRes.body) throw new Error(`audio download failed: ${aRes.status}`);
+    await Promise.all([
+      pipeline(Readable.fromWeb(vRes.body), fs.createWriteStream(videoFile)),
+      pipeline(Readable.fromWeb(aRes.body), fs.createWriteStream(audioFile)),
+    ]);
+    const videoBytes = fs.statSync(videoFile).size;
+    const audioBytes = fs.statSync(audioFile).size;
+    console.log(`[mux-video] video=${(videoBytes / 1024 / 1024).toFixed(1)}MB audio=${(audioBytes / 1024 / 1024).toFixed(1)}MB`);
 
     // -map 0:v:0  → take ONLY the video stream from the source (drop its audio)
     // -map 1:a:0  → take the mixed audio as the new audio track
@@ -202,17 +207,19 @@ async function handleMuxVideo(req, res, API_KEY) {
     const stat = fs.statSync(outputFile);
     console.log(`[mux-video] OK in ${dt}s, ${(stat.size / 1024 / 1024).toFixed(2)}MB, dur=${durationMs ?? "?"}ms`);
 
-    const outputBuffer = fs.readFileSync(outputFile);
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-
     const headers = {
       "Content-Type": "video/mp4",
-      "Content-Length": outputBuffer.length,
+      "Content-Length": stat.size,
       "X-Mux-Audio-Codec": audioCodec,
     };
     if (durationMs != null) headers["X-Mux-Video-Duration-Ms"] = String(durationMs);
     res.writeHead(200, headers);
-    return res.end(outputBuffer);
+    const outputStream = fs.createReadStream(outputFile);
+    outputStream.pipe(res);
+    return await new Promise((resolve, reject) => {
+      res.on("finish", () => { try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {} resolve(); });
+      outputStream.on("error", reject);
+    });
 
   } catch (err) {
     console.error("[mux-video] fatal:", err.message);
