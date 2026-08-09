@@ -132,7 +132,7 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-08-09-segment-delivery-profile";
+const BUILD_TAG = "extractor-2026-08-09-segment-export-audit-hardening";
 
 // ── Non-blocking ffprobe (SOC 2 CC7.2 — never freeze the loop) ──
 // execSync(ffprobe) blocks the single-threaded event loop for the whole probe.
@@ -588,10 +588,10 @@ async function handleProcess(req, res, API_KEY) {
     //   else → lame MP3 (default)
     const procCodecArgs = delivery_profile === "segment_export"
       ? (output_format === "wav"
-        ? "-c:a pcm_s24le -ar 48000"
+        ? "-map_metadata -1 -c:a pcm_s24le -ar 48000"
         : output_format === "flac"
-          ? "-c:a flac -compression_level 8 -ar 48000"
-          : "-c:a libmp3lame -b:a 320k -ar 48000")
+          ? "-map_metadata -1 -c:a flac -compression_level 8 -ar 48000"
+          : "-map_metadata -1 -c:a libmp3lame -b:a 320k -ar 48000")
       : (output_format === "wav"
         ? "-c:a pcm_s16le"
         : output_format === "flac"
