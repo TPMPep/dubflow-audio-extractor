@@ -90,40 +90,37 @@ function runProcess(bin, args, { timeoutMs, maxOutputBytes = 4 * 1024 * 1024 } =
   });
 }
 
-// ── True frame-rate probe (ffprobe) ──────────────────────────────────────────
-// The authoritative, machine-MEASURED frame rate of the source video. This is
-// the enterprise root fix for the SCC frame-rate problem: Project.frame_rate was
-// historically an operator-entered / defaulted number (83% sat at the schema
-// default of 25), so SCC timecodes — which are frame-COUNTED — could be divided
-// by a value nobody verified. ffprobe is already in the ffmpeg image (zero new
-// dependency); we read r_frame_rate ("24000/1001") and evaluate the rational to
-// a float (23.976). Best-effort: any failure returns null so the finalizer keeps
-// the existing value rather than overwriting truth with a worse guess. SOC 2
-// CC8.1 — a measured fps is provably distinct from a defaulted one.
-async function probeSourceFrameRate(sourceUrl) {
+// ── Source metadata probe (ffprobe) ─────────────────────────────────────────
+// One remote probe returns BOTH authoritative duration and frame rate. Duration
+// is required before whole-program language sampling; persisting it here removes
+// the scan-clean race that previously collapsed preflight to the opening minute.
+async function probeSourceMetadata(sourceUrl) {
   try {
     const probe = await runProcess("ffprobe", [
       "-v", "error",
       "-select_streams", "v:0",
-      "-show_entries", "stream=r_frame_rate",
-      "-of", "default=noprint_wrappers=1:nokey=1",
+      "-show_entries", "format=duration:stream=r_frame_rate",
+      "-of", "json",
       sourceUrl,
     ], { timeoutMs: 60_000 });
-    if (probe.status !== 0) return null;
-    const raw = String(probe.stdout || "").trim().split(/\s+/)[0] || "";
-    // r_frame_rate is a rational "num/den" (e.g. "24000/1001", "25/1").
-    const m = raw.match(/^(\d+)\/(\d+)$/);
-    let fps;
-    if (m) {
-      const num = Number(m[1]); const den = Number(m[2]);
-      fps = den > 0 ? num / den : NaN;
-    } else {
-      fps = Number(raw);
-    }
-    if (!Number.isFinite(fps) || fps <= 0 || fps > 240) return null; // sane broadcast bounds
-    return Math.round(fps * 1000) / 1000; // 3-dp: 23.976, 29.97, 25, 24, 59.94
+    if (probe.status !== 0) return { frame_rate: null, duration_ms: null };
+    const parsed = JSON.parse(String(probe.stdout || "{}"));
+    const rawRate = String(parsed?.streams?.[0]?.r_frame_rate || "");
+    const match = rawRate.match(/^(\d+)\/(\d+)$/);
+    const fps = match && Number(match[2]) > 0
+      ? Number(match[1]) / Number(match[2])
+      : Number(rawRate);
+    const durationSec = Number(parsed?.format?.duration);
+    return {
+      frame_rate: Number.isFinite(fps) && fps > 0 && fps <= 240
+        ? Math.round(fps * 1000) / 1000
+        : null,
+      duration_ms: Number.isFinite(durationSec) && durationSec > 0
+        ? Math.round(durationSec * 1000)
+        : null,
+    };
   } catch {
-    return null;
+    return { frame_rate: null, duration_ms: null };
   }
 }
 // Zero-dependency WebCrypto SigV4 signer (replaces @aws-sdk/@smithy — incident
@@ -314,8 +311,9 @@ async function handleProxyGenSync(req, res, API_KEY) {
       }));
     }
 
-    // Probe the SOURCE's true frame rate (best-effort — never blocks the proxy).
-    const sourceFrameRate = await probeSourceFrameRate(source_url);
+    // Probe source truth once: duration drives whole-program preflight sampling;
+    // frame rate drives frame-counted caption exports.
+    const sourceMetadata = await probeSourceMetadata(source_url);
 
     const storage = storageFromEnv({ region, bucket, prefix: credential_secret_prefix });
     // STREAMING uploads — never load the proxy into RAM (the OOM cure). Each
@@ -349,7 +347,8 @@ async function handleProxyGenSync(req, res, API_KEY) {
       duration_ms: durationMs,
       // Machine-measured source frame rate (null if the probe failed). The
       // finalizer writes it to Project.frame_rate with frame_rate_source='ffprobe'.
-      source_frame_rate: sourceFrameRate,
+      source_frame_rate: sourceMetadata.frame_rate,
+      source_duration_ms: sourceMetadata.duration_ms,
       project_id,
     }));
   } catch (err) {
