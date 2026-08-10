@@ -132,7 +132,7 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-08-10-preflight-language-consensus";
+const BUILD_TAG = "extractor-2026-08-10-take-finishing-v1";
 
 // ── Non-blocking ffprobe (SOC 2 CC7.2 — never freeze the loop) ──
 // execSync(ffprobe) blocks the single-threaded event loop for the whole probe.
@@ -649,79 +649,60 @@ async function handleTrim(req, res, API_KEY) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
   const body = JSON.parse(Buffer.concat(chunks).toString());
-
-  const authHeader = req.headers["authorization"] || "";
-  const token = authHeader.replace("Bearer ", "");
+  const token = (req.headers["authorization"] || "").replace("Bearer ", "");
   if (token !== API_KEY && body.api_key !== API_KEY) {
-    res.writeHead(401);
-    return res.end(JSON.stringify({ error: "Unauthorized" }));
+    res.writeHead(401); return res.end(JSON.stringify({ error: "Unauthorized" }));
   }
 
-  const {
-    audio_url,
-    start_ms,
-    end_ms,
-    fade_in_ms = 30,
-    fade_out_ms = 50,
-    output_format = "mp3",
-  } = body;
-
-  if (!audio_url || start_ms == null || end_ms == null) {
-    res.writeHead(400);
-    return res.end(JSON.stringify({ error: "audio_url, start_ms, end_ms required" }));
-  }
-  if (end_ms <= start_ms) {
-    res.writeHead(400);
-    return res.end(JSON.stringify({ error: "end_ms must be greater than start_ms" }));
+  const { audio_url, start_ms, end_ms, fade_in_ms = 30, fade_out_ms = 50, tail_pad_ms = 0, output_format = "mp3" } = body;
+  const format = output_format === "wav" ? "wav" : "mp3";
+  const startMs = Math.round(Number(start_ms));
+  const endMs = Math.round(Number(end_ms));
+  const fadeInMs = Math.max(0, Math.min(250, Math.round(Number(fade_in_ms) || 0)));
+  const fadeOutMs = Math.max(0, Math.min(250, Math.round(Number(fade_out_ms) || 0)));
+  const tailPadMs = Math.max(0, Math.min(1000, Math.round(Number(tail_pad_ms) || 0)));
+  if (!audio_url || !Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
+    res.writeHead(400); return res.end(JSON.stringify({ error: "audio_url and a valid start_ms/end_ms window are required" }));
   }
 
   const tmpDir = fs.mkdtempSync('/tmp/trim_');
   const inputFile = `${tmpDir}/input`;
-  const outputFile = `${tmpDir}/output.${output_format}`;
-
+  const outputFile = `${tmpDir}/output.${format}`;
   try {
-    const startSec = (start_ms / 1000).toFixed(3);
-    const durationMs = end_ms - start_ms;
-    const durationSec = (durationMs / 1000).toFixed(3);
-    const fadeInSec = (fade_in_ms / 1000).toFixed(3);
-    const fadeOutSec = (fade_out_ms / 1000).toFixed(3);
-    const fadeOutStartSec = ((durationMs - fade_out_ms) / 1000).toFixed(3);
-
-    console.log(`[trim] start=${startSec}s dur=${durationSec}s fadeIn=${fadeInSec}s fadeOut=${fadeOutSec}s`);
-
     const downloadRes = await fetch(audio_url);
     if (!downloadRes.ok) throw new Error(`Download failed: ${downloadRes.status}`);
-    const audioArrayBuffer = await downloadRes.arrayBuffer();
-    fs.writeFileSync(inputFile, Buffer.from(audioArrayBuffer));
+    fs.writeFileSync(inputFile, Buffer.from(await downloadRes.arrayBuffer()));
+    const sourceProbe = await runFfprobe(["-v", "quiet", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", inputFile]);
+    const sourceDurationMs = Math.round((parseFloat(sourceProbe) || 0) * 1000);
+    if (!sourceDurationMs || startMs < 0 || endMs > sourceDurationMs + 20) throw new Error(`Trim window ${startMs}-${endMs}ms is outside source duration ${sourceDurationMs}ms`);
 
-    // Only apply fades if window is long enough to fit them comfortably
-    const totalSec = parseFloat(durationSec);
+    const contentMs = endMs - startMs;
+    const finalMs = contentMs + tailPadMs;
     const filters = [];
-    if (fade_in_ms > 0 && totalSec > parseFloat(fadeInSec) * 2) {
-      filters.push(`afade=t=in:st=0:d=${fadeInSec}`);
+    if (fadeInMs > 0 && contentMs > fadeInMs * 2) filters.push(`afade=t=in:st=0:d=${(fadeInMs / 1000).toFixed(4)}:curve=tri`);
+    if (fadeOutMs > 0 && contentMs > fadeOutMs * 2) filters.push(`afade=t=out:st=${Math.max(0, (contentMs - fadeOutMs) / 1000).toFixed(4)}:d=${(fadeOutMs / 1000).toFixed(4)}:curve=tri`);
+    if (tailPadMs > 0) {
+      filters.push(`apad=pad_dur=${(finalMs / 1000).toFixed(6)}`);
+      filters.push(`atrim=duration=${(finalMs / 1000).toFixed(6)}`);
     }
-    if (fade_out_ms > 0 && totalSec > parseFloat(fadeOutSec) * 2) {
-      filters.push(`afade=t=out:st=${fadeOutStartSec}:d=${fadeOutSec}`);
-    }
-    const filterArgs = filters.length > 0 ? ["-af", filters.join(",")] : [];
-
-    const trimArgs = [
-      "-y", "-ss", startSec, "-t", durationSec, "-i", inputFile,
-      ...filterArgs, "-c:a", "libmp3lame", "-q:a", "2", "-ac", "1", "-ar", "44100", outputFile,
-    ];
-    console.log(`[trim] Running: ffmpeg ${trimArgs.join(" ")}`);
-    await runFfmpeg(trimArgs, { timeoutMs: 30000, label: "Trim" });
+    filters.push('asetpts=N/SR/TB');
+    const codec = format === "wav" ? ["-c:a", "pcm_s24le", "-ar", "48000"] : ["-c:a", "libmp3lame", "-q:a", "2", "-ar", "44100"];
+    await runFfmpeg(["-y", "-ss", (startMs / 1000).toFixed(6), "-t", (contentMs / 1000).toFixed(6), "-i", inputFile,
+      "-af", filters.join(','), "-vn", ...codec, "-ac", "1", outputFile], { timeoutMs: 30000, label: "Take finishing" });
 
     const outputBuffer = fs.readFileSync(outputFile);
-    console.log(`[trim] Output: ${(outputBuffer.length / 1024).toFixed(0)}KB, dur=${durationSec}s`);
-
+    const outputProbe = await runFfprobe(["-v", "quiet", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", outputFile]);
+    const outputDurationMs = Math.round((parseFloat(outputProbe) || 0) * 1000);
+    if (!outputDurationMs || outputBuffer.length < 1024) throw new Error("Finishing render could not be duration-verified");
     fs.rmSync(tmpDir, { recursive: true, force: true });
-    res.writeHead(200, { "Content-Type": `audio/${output_format}` });
+    res.writeHead(200, { "Content-Type": format === "wav" ? "audio/wav" : "audio/mpeg",
+      "X-Source-Duration-Ms": String(sourceDurationMs), "X-Output-Duration-Ms": String(outputDurationMs),
+      "X-Trim-Start-Ms": String(startMs), "X-Trim-End-Ms": String(endMs), "X-Tail-Pad-Ms": String(tailPadMs) });
     res.end(outputBuffer);
   } catch (err) {
     console.error("[trim] Error:", err.message);
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
-    res.writeHead(500);
+    res.writeHead(500, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ error: err.message }));
   }
 }
