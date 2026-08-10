@@ -32,6 +32,11 @@ const { spawn } = require("child_process");
 const { Readable } = require("stream");
 const { pipeline } = require("stream/promises");
 const fs = require("fs");
+const { createSemaphore } = require("./s3-signer");
+
+const SCENE_RENDER_MODEL_VERSION = 2;
+const MIX_LANE = createSemaphore(Math.max(1, Math.min(8, Number(process.env.MIX_MAX_CONCURRENCY) || 2)));
+function getMixLaneStatus() { return { in_use: MIX_LANE.inUse(), max: MIX_LANE.max, scene_render_model_version: SCENE_RENDER_MODEL_VERSION }; }
 
 // Max clips summed in a single intermediate FFmpeg pass. Keeps peak memory
 // bounded regardless of total clip count. 80 is comfortably safe on a small
@@ -103,10 +108,11 @@ function buildClipChain(c, inIdx, outLabel, sampleRate, fadeInSec, fadeOutSec) {
   const echoDelay = Math.max(15, Math.min(250, Number(placement?.echo_delay_ms) || 60));
   const echoFeedback = Math.max(0, Math.min(0.65, Number(placement?.echo_feedback) || 0));
   const pan = Math.max(-1, Math.min(1, Number(placement?.pan) || 0));
-  const echoDecay = Math.min(0.9, room * 0.7 + echoFeedback * 0.5);
-  const placementPart = placement
-    ? `highpass=f=${hp.toFixed(1)},lowpass=f=${lp.toFixed(1)},${compression > 0 ? `acompressor=threshold=0.1259:ratio=${(1 + compression * 11).toFixed(2)},` : ''}${room > 0 ? `aecho=1:1:${echoDelay.toFixed(1)}:${Math.max(0.02, echoDecay).toFixed(3)},` : ''}${Math.abs(pan) > 0.001 ? `pan=stereo|c0=${(pan <= 0 ? 1 : 1 - pan).toFixed(3)}*c0|c1=${(pan >= 0 ? 1 : 1 + pan).toFixed(3)}*c1,` : ''}`
+  const modelVersion = Number(c.scene_placement?.recipe_model_version || 1);
+  const filterPart = placement
+    ? `highpass=f=${hp.toFixed(1)},lowpass=f=${lp.toFixed(1)},${compression > 0 ? `acompressor=threshold=0.1259:ratio=${(1 + compression * 11).toFixed(2)}:knee=1:attack=10:release=250,` : ''}`
     : '';
+  const panPart = Math.abs(pan) > 0.001 ? `pan=stereo|c0=${(pan <= 0 ? 1 : 1 - pan).toFixed(3)}*c0|c1=${(pan >= 0 ? 1 : 1 + pan).toFixed(3)}*c1,` : '';
 
   const rate = Number(c.playback_rate);
   const tempoPart = (Number.isFinite(rate) && rate > 0 && Math.abs(rate - 1) > 0.001)
@@ -121,19 +127,21 @@ function buildClipChain(c, inIdx, outLabel, sampleRate, fadeInSec, fadeOutSec) {
   const fadeInPart = fadeInSec > 0 ? `afade=t=in:st=0:d=${fadeInSec}:curve=tri,` : "";
   const fadeOutPart = fadeOutSec > 0 ? `areverse,afade=t=in:st=0:d=${fadeOutSec}:curve=tri,areverse,` : "";
 
-  return (
-    `[${inIdx}:a]` +
-    `aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo,` +
-    tempoPart +
-    trimPart +
-    fadeInPart +
-    fadeOutPart +
-    placementPart +
-    (gainDb !== 0 ? `volume=${gainDb}dB,` : "") +
-    `adelay=${delay}|${delay},` +
-    `apad` +
-    `[${outLabel}]`
-  );
+  const prefix = `[${inIdx}:a]aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo,${tempoPart}${trimPart}${fadeInPart}${fadeOutPart}${filterPart}`;
+  const suffix = `${panPart}${gainDb !== 0 ? `volume=${gainDb}dB,` : ""}adelay=${delay}|${delay},apad[${outLabel}]`;
+  if (!placement || room <= 0) return `${prefix}${suffix}`;
+  if (modelVersion <= 1) {
+    const decay = Math.max(0.01, room * Math.max(0.05, echoFeedback));
+    return `${prefix}aecho=1:1:${echoDelay.toFixed(1)}:${decay.toFixed(3)},${suffix}`;
+  }
+  const labels = [`${outLabel}dry`, `${outLabel}t1`, `${outLabel}t2`, `${outLabel}t3`];
+  const branches = [`${prefix}asplit=4${labels.map(l => `[${l}]`).join("")}`];
+  for (let tap = 1; tap <= 3; tap++) {
+    const wet = room * Math.pow(echoFeedback, tap - 1);
+    branches.push(`[${outLabel}t${tap}]adelay=${Math.round(echoDelay * tap)}|${Math.round(echoDelay * tap)},volume=${wet.toFixed(6)}[${outLabel}e${tap}]`);
+  }
+  branches.push(`[${outLabel}dry][${outLabel}e1][${outLabel}e2][${outLabel}e3]amix=inputs=4:duration=longest:normalize=0:dropout_transition=0,${suffix}`);
+  return branches.join(";");
 }
 
 // Mix one consecutive batch into a timeline-local intermediate WAV. The caller
@@ -254,6 +262,11 @@ async function handleMixFinal(req, res, API_KEY) {
     if (!Number.isFinite(Number(c.start_ms)) || Number(c.start_ms) < 0) {
       res.writeHead(400); return res.end(JSON.stringify({ error: `clips[${i}].start_ms must be >= 0` }));
     }
+    const modelVersion = Number(c.scene_placement?.recipe_model_version || 1);
+    if (!Number.isInteger(modelVersion) || modelVersion < 1 || modelVersion > SCENE_RENDER_MODEL_VERSION) {
+      res.writeHead(409, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: "unsupported_scene_render_model", requested: modelVersion, supported: SCENE_RENDER_MODEL_VERSION }));
+    }
   }
   if (meTrack && (typeof meTrack !== "object" || typeof meTrack.url !== "string")) {
     res.writeHead(400); return res.end(JSON.stringify({ error: "me_track.url required when me_track is set" }));
@@ -262,8 +275,12 @@ async function handleMixFinal(req, res, API_KEY) {
     res.writeHead(400); return res.end(JSON.stringify({ error: "vocals_track.url required when vocals_track is set" }));
   }
 
-  const tmpDir = `/tmp/mix_${Date.now()}`;
-  fs.mkdirSync(tmpDir, { recursive: true });
+  if (!MIX_LANE.tryAcquire()) {
+    res.writeHead(503, { "Content-Type": "application/json", "Retry-After": "30" });
+    return res.end(JSON.stringify({ error: "mix_lane_busy", retryable: true, lane: getMixLaneStatus() }));
+  }
+
+  const tmpDir = fs.mkdtempSync('/tmp/mix_');
   const outputFile = `${tmpDir}/out.${outputFormat}`;
   const durationSec = durationMs / 1000;
   const fadeInSec = fadeInMs / 1000;
@@ -289,9 +306,13 @@ async function handleMixFinal(req, res, API_KEY) {
       const batch = localClips.slice(from, to);
       const batchStartMs = Math.max(0, Number(batch[0].start_ms) || 0);
       const nextStartMs = to < localClips.length ? Number(localClips[to].start_ms) : durationMs;
-      // Preserve up to 300ms of acoustic tail across batch boundaries so a
-      // hallway/room echo never changes merely because it landed at batch N.
-      const spanEndMs = Number.isFinite(nextStartMs) ? nextStartMs + (to < localClips.length ? 300 : 0) : durationMs;
+      // Preserve the full v2 three-tap acoustic tail across batch boundaries.
+      const maxTailMs = batch.reduce((max, clip) => {
+        const p = clip.scene_placement;
+        if (!p?.recipe || p.preset_key === 'clean' || Number(p.recipe.room_mix || 0) <= 0) return max;
+        return Math.max(max, (Number(p.recipe.echo_delay_ms) || 60) * (Number(p.recipe_model_version || 1) >= 2 ? 3 : 1));
+      }, 0);
+      const spanEndMs = Number.isFinite(nextStartMs) ? nextStartMs + (to < localClips.length ? maxTailMs : 0) : durationMs;
       const batchEndMs = Math.max(batchStartMs + 1, Math.min(durationMs, spanEndMs));
       const localBatch = batch.map((clip) => ({ ...clip, start_ms: Math.max(0, Number(clip.start_ms) - batchStartMs) }));
       const interFile = `${tmpDir}/inter_${b}.wav`;
@@ -407,7 +428,9 @@ async function handleMixFinal(req, res, API_KEY) {
       stderr_tail: stderrTail,
       detail: err.message,
     }));
+  } finally {
+    MIX_LANE.release();
   }
 }
 
-module.exports = { routeMixFinal };
+module.exports = { routeMixFinal, getMixLaneStatus };
