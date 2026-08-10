@@ -103,8 +103,9 @@ function buildClipChain(c, inIdx, outLabel, sampleRate, fadeInSec, fadeOutSec) {
   const echoDelay = Math.max(15, Math.min(250, Number(placement?.echo_delay_ms) || 60));
   const echoFeedback = Math.max(0, Math.min(0.65, Number(placement?.echo_feedback) || 0));
   const pan = Math.max(-1, Math.min(1, Number(placement?.pan) || 0));
+  const echoDecay = Math.min(0.9, room * 0.7 + echoFeedback * 0.5);
   const placementPart = placement
-    ? `highpass=f=${hp.toFixed(1)},lowpass=f=${lp.toFixed(1)},${compression > 0 ? `acompressor=threshold=0.1259:ratio=${(1 + compression * 11).toFixed(2)},` : ''}${room > 0 ? `aecho=1:1:${echoDelay.toFixed(1)}:${Math.max(0.01, room * Math.max(0.05, echoFeedback)).toFixed(3)},` : ''}${Math.abs(pan) > 0.001 ? `pan=stereo|c0=${(pan <= 0 ? 1 : 1 - pan).toFixed(3)}*c0|c1=${(pan >= 0 ? 1 : 1 + pan).toFixed(3)}*c1,` : ''}`
+    ? `highpass=f=${hp.toFixed(1)},lowpass=f=${lp.toFixed(1)},${compression > 0 ? `acompressor=threshold=0.1259:ratio=${(1 + compression * 11).toFixed(2)},` : ''}${room > 0 ? `aecho=1:1:${echoDelay.toFixed(1)}:${Math.max(0.02, echoDecay).toFixed(3)},` : ''}${Math.abs(pan) > 0.001 ? `pan=stereo|c0=${(pan <= 0 ? 1 : 1 - pan).toFixed(3)}*c0|c1=${(pan >= 0 ? 1 : 1 + pan).toFixed(3)}*c1,` : ''}`
     : '';
 
   const rate = Number(c.playback_rate);
