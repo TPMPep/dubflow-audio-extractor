@@ -43,7 +43,7 @@ function runFfmpeg(args, { timeoutMs = 120000, label = "ffmpeg" } = {}) {
 // 2026-07-07/08). STS session-token aware. See ./s3-signer.js.
 const s3signer = require("./s3-signer");
 const { presignS3Url, putS3Object, storageFromEnv, storageFromExplicit } = s3signer;
-const { routeMixFinal } = require("./mixFinal");
+const { routeMixFinal, getMixLaneStatus } = require("./mixFinal");
 const { routeMuxVideo } = require("./muxVideo");
 const { routeProxyGen } = require("./proxyGenerator");
 const { routeHlsIngest } = require("./hlsIngest");
@@ -132,7 +132,7 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-08-09-scene-placement-v1";
+const BUILD_TAG = "extractor-2026-08-10-scene-placement-qc-v2";
 
 // ── Non-blocking ffprobe (SOC 2 CC7.2 — never freeze the loop) ──
 // execSync(ffprobe) blocks the single-threaded event loop for the whole probe.
@@ -1018,6 +1018,7 @@ const server = http.createServer(async (req, res) => {
       build_tag: BUILD_TAG,
       contract_ok: contract.ok,
       contract_missing: contract.missing,
+      mix_lane: getMixLaneStatus(),
     }));
   }
 
