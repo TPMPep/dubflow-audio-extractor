@@ -33,8 +33,14 @@ const { Readable } = require("stream");
 const { pipeline } = require("stream/promises");
 const fs = require("fs");
 const { createSemaphore } = require("./s3-signer");
+const { buildImpulse, recipeKey, writeFloatWav } = require("./sceneReverb");
 
-const SCENE_RENDER_MODEL_VERSION = 2;
+const SCENE_RENDER_MODEL_VERSION = 4;
+const DEVICE_EQ_BANDS = {
+  telephone: [[1250, 7.5, 1.3]], television: [[650, 6, 1.1], [2800, -2.5, 1.4]],
+  broadcast_radio: [[2800, 5, .75], [180, 2, .8]], walkie_talkie: [[1650, 10, 1.8], [850, -4, 1.1]],
+  intercom: [[2200, 9, 1.2], [720, 3, .9]], earpiece: [[2400, 8, 1.5], [900, -3, 1.1]],
+};
 const MIX_LANE = createSemaphore(Math.max(1, Math.min(8, Number(process.env.MIX_MAX_CONCURRENCY) || 2)));
 function getMixLaneStatus() { return { in_use: MIX_LANE.inUse(), max: MIX_LANE.max, scene_render_model_version: SCENE_RENDER_MODEL_VERSION }; }
 
@@ -104,44 +110,39 @@ function buildClipChain(c, inIdx, outLabel, sampleRate, fadeInSec, fadeOutSec) {
   const hp = Math.max(20, Math.min(1200, Number(placement?.highpass_hz) || 60));
   const lp = Math.max(1200, Math.min(20000, Number(placement?.lowpass_hz) || 20000));
   const compression = Math.max(0, Math.min(1, Number(placement?.compression) || 0));
-  const room = Math.max(0, Math.min(0.65, Number(placement?.room_mix) || 0));
+  const room = Math.max(0, Math.min(0.75, Number(placement?.room_mix) || 0));
   const echoDelay = Math.max(15, Math.min(250, Number(placement?.echo_delay_ms) || 60));
   const echoFeedback = Math.max(0, Math.min(0.65, Number(placement?.echo_feedback) || 0));
   const pan = Math.max(-1, Math.min(1, Number(placement?.pan) || 0));
+  const saturation = Math.max(0, Math.min(1, Number(placement?.saturation) || 0));
+  const width = Math.max(0, Math.min(1, Math.min(Number(placement?.stereo_width ?? 1), 1 - Number(placement?.mono_amount || 0))));
   const modelVersion = Number(c.scene_placement?.recipe_model_version || 1);
-  const filterPart = placement
-    ? `highpass=f=${hp.toFixed(1)},lowpass=f=${lp.toFixed(1)},${compression > 0 ? `acompressor=threshold=0.1259:ratio=${(1 + compression * 11).toFixed(2)}:knee=1:attack=10:release=250,` : ''}`
-    : '';
-  const panPart = Math.abs(pan) > 0.001 ? `pan=stereo|c0=${(pan <= 0 ? 1 : 1 - pan).toFixed(3)}*c0|c1=${(pan >= 0 ? 1 : 1 + pan).toFixed(3)}*c1,` : '';
-
+  const crusherPart = modelVersion >= 3 && saturation > 0 ? `acrusher=bits=${(16 - saturation * 8).toFixed(2)}:mix=${saturation.toFixed(3)},` : '';
+  const deviceEqPart = modelVersion >= 4 ? (DEVICE_EQ_BANDS[placement?.device_key] || []).map(([frequency, boost, q]) => `equalizer=f=${frequency}:t=q:w=${q}:g=${boost},`).join('') : '';
+  const filterPart = placement ? `highpass=f=${hp.toFixed(1)},lowpass=f=${lp.toFixed(1)},${deviceEqPart}${compression > 0 ? `acompressor=threshold=0.1259:ratio=${(1 + compression * 11).toFixed(2)}:knee=1:attack=10:release=250,` : ''}${crusherPart}` : '';
+  const leftSelf = ((1 + width) / 2) * (pan <= 0 ? 1 : 1 - pan), leftCross = ((1 - width) / 2) * (pan <= 0 ? 1 : 1 - pan);
+  const rightSelf = ((1 + width) / 2) * (pan >= 0 ? 1 : 1 + pan), rightCross = ((1 - width) / 2) * (pan >= 0 ? 1 : 1 + pan);
+  const stereoPart = placement ? `pan=stereo|c0=${leftSelf.toFixed(3)}*c0+${leftCross.toFixed(3)}*c1|c1=${rightCross.toFixed(3)}*c0+${rightSelf.toFixed(3)}*c1,` : '';
   const rate = Number(c.playback_rate);
-  const tempoPart = (Number.isFinite(rate) && rate > 0 && Math.abs(rate - 1) > 0.001)
-    ? `atempo=${Math.max(0.5, Math.min(2.0, rate)).toFixed(4)},`
-    : "";
-
+  const tempoPart = Number.isFinite(rate) && rate > 0 && Math.abs(rate - 1) > .001 ? `atempo=${Math.max(.5, Math.min(2, rate)).toFixed(4)},` : '';
   const maxDurMs = Number(c.max_duration_ms);
-  const trimPart = (Number.isFinite(maxDurMs) && maxDurMs > 0)
-    ? `atrim=end=${(maxDurMs / 1000).toFixed(4)},`
-    : "";
-
-  const fadeInPart = fadeInSec > 0 ? `afade=t=in:st=0:d=${fadeInSec}:curve=tri,` : "";
-  const fadeOutPart = fadeOutSec > 0 ? `areverse,afade=t=in:st=0:d=${fadeOutSec}:curve=tri,areverse,` : "";
-
+  const trimPart = Number.isFinite(maxDurMs) && maxDurMs > 0 ? `atrim=end=${(maxDurMs / 1000).toFixed(4)},` : '';
+  const fadeInPart = fadeInSec > 0 ? `afade=t=in:st=0:d=${fadeInSec}:curve=tri,` : '';
+  const fadeOutPart = fadeOutSec > 0 ? `areverse,afade=t=in:st=0:d=${fadeOutSec}:curve=tri,areverse,` : '';
   const prefix = `[${inIdx}:a]aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo,${tempoPart}${trimPart}${fadeInPart}${fadeOutPart}${filterPart}`;
-  const suffix = `${panPart}${gainDb !== 0 ? `volume=${gainDb}dB,` : ""}adelay=${delay}|${delay},apad[${outLabel}]`;
+  const suffix = `${stereoPart}${gainDb !== 0 ? `volume=${gainDb}dB,` : ''}adelay=${delay}|${delay},apad[${outLabel}]`;
   if (!placement || room <= 0) return `${prefix}${suffix}`;
-  if (modelVersion <= 1) {
-    const decay = Math.max(0.01, room * Math.max(0.05, echoFeedback));
-    return `${prefix}aecho=1:1:${echoDelay.toFixed(1)}:${decay.toFixed(3)},${suffix}`;
+  if (modelVersion <= 1) return `${prefix}aecho=1:1:${echoDelay.toFixed(1)}:${Math.max(.01, room * Math.max(.05, echoFeedback)).toFixed(3)},${suffix}`;
+  if (modelVersion === 2) {
+    const labels = [`${outLabel}dry`, `${outLabel}t1`, `${outLabel}t2`, `${outLabel}t3`];
+    const branches = [`${prefix}asplit=4${labels.map(l => `[${l}]`).join('')}`];
+    for (let tap = 1; tap <= 3; tap++) branches.push(`[${outLabel}t${tap}]adelay=${Math.round(echoDelay * tap)}|${Math.round(echoDelay * tap)},volume=${(room * Math.pow(echoFeedback, tap - 1)).toFixed(6)}[${outLabel}e${tap}]`);
+    branches.push(`[${outLabel}dry][${outLabel}e1][${outLabel}e2][${outLabel}e3]amix=inputs=4:duration=longest:normalize=0:dropout_transition=0,${suffix}`);
+    return branches.join(';');
   }
-  const labels = [`${outLabel}dry`, `${outLabel}t1`, `${outLabel}t2`, `${outLabel}t3`];
-  const branches = [`${prefix}asplit=4${labels.map(l => `[${l}]`).join("")}`];
-  for (let tap = 1; tap <= 3; tap++) {
-    const wet = room * Math.pow(echoFeedback, tap - 1);
-    branches.push(`[${outLabel}t${tap}]adelay=${Math.round(echoDelay * tap)}|${Math.round(echoDelay * tap)},volume=${wet.toFixed(6)}[${outLabel}e${tap}]`);
-  }
-  branches.push(`[${outLabel}dry][${outLabel}e1][${outLabel}e2][${outLabel}e3]amix=inputs=4:duration=longest:normalize=0:dropout_transition=0,${suffix}`);
-  return branches.join(";");
+  const irInput = Number(c.scene_ir_input_idx);
+  if (!Number.isInteger(irInput) || irInput < 1) throw new Error(`scene placement model 3 missing impulse response for ${outLabel}`);
+  return `${prefix}[${outLabel}processed];[${outLabel}processed][${irInput}:a]afir=dry=0:wet=1:irfmt=input,${suffix}`;
 }
 
 // Mix one consecutive batch into a timeline-local intermediate WAV. The caller
@@ -154,6 +155,22 @@ async function mixBatch(clips, durationSec, sampleRate, fadeInSec, fadeOutSec, o
   args.push("-f", "lavfi", "-t", String(durationSec),
     "-i", `anullsrc=channel_layout=stereo:sample_rate=${sampleRate}`);
   for (const c of clips) args.push("-i", c.local_path || c.url);
+  // Model-3 room responses are generated once per unique recipe in this batch,
+  // then reused by every matching clip. This is deterministic convolution—not
+  // repeated slap echoes—and keeps CPU/memory bounded at 100+ user concurrency.
+  const irInputs = new Map();
+  for (const clip of clips) {
+    const placement = clip.scene_placement;
+    if (!placement?.recipe || placement.preset_key === 'clean' || Number(placement.recipe_model_version || 1) < 3 || Number(placement.recipe.room_mix || 0) <= 0) continue;
+    const key = recipeKey(placement.recipe);
+    if (!irInputs.has(key)) {
+      const path = `${outFile}.ir_${irInputs.size}.wav`;
+      writeFloatWav(path, buildImpulse(placement.recipe, sampleRate), sampleRate);
+      irInputs.set(key, { path, input_idx: 1 + clips.length + irInputs.size });
+      args.push('-i', path);
+    }
+    clip.scene_ir_input_idx = irInputs.get(key).input_idx;
+  }
 
   const filterParts = [`[0:a]aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo[base]`];
   const mixLabels = ["[base]"];
@@ -310,7 +327,11 @@ async function handleMixFinal(req, res, API_KEY) {
       const maxTailMs = batch.reduce((max, clip) => {
         const p = clip.scene_placement;
         if (!p?.recipe || p.preset_key === 'clean' || Number(p.recipe.room_mix || 0) <= 0) return max;
-        return Math.max(max, (Number(p.recipe.echo_delay_ms) || 60) * (Number(p.recipe_model_version || 1) >= 2 ? 3 : 1));
+        const modelVersion = Number(p.recipe_model_version || 1);
+        const tailMs = modelVersion >= 3
+          ? Number(p.recipe.pre_delay_ms || 0) + Number(p.recipe.decay_seconds || .35) * 1000
+          : (Number(p.recipe.echo_delay_ms) || 60) * (modelVersion >= 2 ? 3 : 1);
+        return Math.max(max, tailMs);
       }, 0);
       const spanEndMs = Number.isFinite(nextStartMs) ? nextStartMs + (to < localClips.length ? maxTailMs : 0) : durationMs;
       const batchEndMs = Math.max(batchStartMs + 1, Math.min(durationMs, spanEndMs));
