@@ -132,7 +132,43 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-08-11-scene-placement-device-signatures-v4";
+const BUILD_TAG = "extractor-2026-08-18-take-finishing-pitch-gain-v1";
+
+// ── FILTER CAPABILITY PROBE (enterprise-grade — SOC 2 CC7.2) ─────────────────
+// Formant-preserving pitch requires an ffmpeg built with librubberband, and the
+// true-peak ceiling requires alimiter. Neither is guaranteed by `apt install
+// ffmpeg`, and a MISSING filter fails only at render time with a cryptic
+// "No such filter". We therefore probe `ffmpeg -filters` ONCE, cache it, expose
+// it on /health, and REFUSE a pitch request when rubberband is absent — never
+// silently substitute asetrate, which shifts formants with the pitch and would
+// produce a chipmunked deliverable while the audit row claims formant-preserved.
+let _filterCaps = null;
+async function getFilterCaps() {
+  if (_filterCaps) return _filterCaps;
+  const listing = await new Promise((resolve) => {
+    const child = spawn("ffmpeg", ["-hide_banner", "-filters"], { stdio: ["ignore", "pipe", "ignore"] });
+    let out = "";
+    let settled = false;
+    const done = () => { if (settled) return; settled = true; clearTimeout(t); resolve(out); };
+    const t = setTimeout(() => { try { child.kill("SIGKILL"); } catch (_) { /* gone */ } done(); }, 10000);
+    child.stdout.on("data", (d) => { out += d.toString(); });
+    child.on("error", done);
+    child.on("close", done);
+  });
+  _filterCaps = {
+    rubberband: /\brubberband\b/.test(listing),
+    alimiter: /\balimiter\b/.test(listing),
+  };
+  return _filterCaps;
+}
+
+// Sample-peak / mean measurement from an ffmpeg volumedetect stderr report.
+// Deliberately named dBFS (sample peak), NOT dBTP — we measure what volumedetect
+// actually reports and never overclaim true-peak compliance in an audit field.
+function parseVolumeDb(report, name) {
+  const match = String(report || "").match(new RegExp(`${name}:\\s*(-?[0-9.]+)\\s*dB`, "i"));
+  return match ? Number(match[1]) : null;
+}
 
 // ── Non-blocking ffprobe (SOC 2 CC7.2 — never freeze the loop) ──
 // execSync(ffprobe) blocks the single-threaded event loop for the whole probe.
@@ -654,15 +690,28 @@ async function handleTrim(req, res, API_KEY) {
     res.writeHead(401); return res.end(JSON.stringify({ error: "Unauthorized" }));
   }
 
-  const { audio_url, start_ms, end_ms, fade_in_ms = 30, fade_out_ms = 50, tail_pad_ms = 0, output_format = "mp3" } = body;
+  const { audio_url, start_ms, end_ms, fade_in_ms = 30, fade_out_ms = 50, tail_pad_ms = 0, output_format = "mp3",
+    pitch_semitones = 0, gain_db = 0 } = body;
   const format = output_format === "wav" ? "wav" : "mp3";
   const startMs = Math.round(Number(start_ms));
   const endMs = Math.round(Number(end_ms));
   const fadeInMs = Math.max(0, Math.min(250, Math.round(Number(fade_in_ms) || 0)));
   const fadeOutMs = Math.max(0, Math.min(250, Math.round(Number(fade_out_ms) || 0)));
   const tailPadMs = Math.max(0, Math.min(1000, Math.round(Number(tail_pad_ms) || 0)));
+  // Corrective post-processing bounds. Pitch is formant-preserving and
+  // duration-neutral; gain is bounded and peak-protected. Both are deliberately
+  // narrow — this endpoint corrects a take, it never re-voices one.
+  const pitchSemitones = Math.max(-2, Math.min(2, Number(pitch_semitones) || 0));
+  const gainDb = Math.max(-6, Math.min(6, Number(gain_db) || 0));
+  const PEAK_CEILING_DBFS = -1;
+  const peakCeilingLinear = Math.pow(10, PEAK_CEILING_DBFS / 20);
   if (!audio_url || !Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
     res.writeHead(400); return res.end(JSON.stringify({ error: "audio_url and a valid start_ms/end_ms window are required" }));
+  }
+  const caps = await getFilterCaps();
+  if (Math.abs(pitchSemitones) > 0.01 && !caps.rubberband) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ error: "This ffmpeg build has no librubberband, so formant-preserving pitch is unavailable. Pitch is refused rather than substituted with a formant-shifting fallback.", code: "pitch_unsupported" }));
   }
 
   const tmpDir = fs.mkdtempSync('/tmp/trim_');
@@ -679,8 +728,28 @@ async function handleTrim(req, res, API_KEY) {
     const contentMs = endMs - startMs;
     const finalMs = contentMs + tailPadMs;
     const filters = [];
+    // 1) PITCH — formant-preserving (librubberband). `formant=preserved` keeps the
+    // vocal tract fixed while the fundamental moves, so the speaker's identity is
+    // retained instead of chipmunked. Tempo is untouched, so the pass is
+    // length-preserving; rubberband can still land a handful of samples off, so we
+    // pin the result back to the exact content duration. Duration neutrality is
+    // then PROVEN by the caller's ffprobe comparison, not assumed.
+    if (Math.abs(pitchSemitones) > 0.01) {
+      const pitchRatio = Math.pow(2, pitchSemitones / 12);
+      filters.push(`rubberband=pitch=${pitchRatio.toFixed(6)}:formant=preserved:transients=crisp:pitchq=quality:channels=together`);
+      filters.push(`apad=whole_dur=${(contentMs / 1000).toFixed(6)}`);
+      filters.push(`atrim=duration=${(contentMs / 1000).toFixed(6)}`);
+    }
     if (fadeInMs > 0 && contentMs > fadeInMs * 2) filters.push(`afade=t=in:st=0:d=${(fadeInMs / 1000).toFixed(4)}:curve=tri`);
     if (fadeOutMs > 0 && contentMs > fadeOutMs * 2) filters.push(`afade=t=out:st=${Math.max(0, (contentMs - fadeOutMs) / 1000).toFixed(4)}:d=${(fadeOutMs / 1000).toFixed(4)}:curve=tri`);
+    // 2) GAIN — applied AFTER the edge fades so a fade's shape is unaffected, and
+    // followed by a lookahead limiter whenever the operator BOOSTS, so a hot take
+    // can never be pushed into clipping. `level=disabled` stops alimiter from
+    // auto-normalizing (which would silently undo the operator's own level).
+    if (Math.abs(gainDb) > 0.01) {
+      filters.push(`volume=${gainDb.toFixed(2)}dB`);
+      if (gainDb > 0 && caps.alimiter) filters.push(`alimiter=limit=${peakCeilingLinear.toFixed(6)}:level=disabled`);
+    }
     if (tailPadMs > 0) {
       filters.push(`apad=pad_dur=${(finalMs / 1000).toFixed(6)}`);
       filters.push(`atrim=duration=${(finalMs / 1000).toFixed(6)}`);
@@ -694,10 +763,24 @@ async function handleTrim(req, res, API_KEY) {
     const outputProbe = await runFfprobe(["-v", "quiet", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", outputFile]);
     const outputDurationMs = Math.round((parseFloat(outputProbe) || 0) * 1000);
     if (!outputDurationMs || outputBuffer.length < 1024) throw new Error("Finishing render could not be duration-verified");
+    // Measure the RENDERED file so the caller persists an evidenced peak rather
+    // than an intended one. A failed measurement degrades the header to absent —
+    // it never fails an otherwise-good render (the caller decides how to treat a
+    // missing measurement).
+    const outputVolumeReport = await runFfmpeg(
+      ["-hide_banner", "-nostdin", "-i", outputFile, "-af", "volumedetect", "-f", "null", "-"],
+      { timeoutMs: 30000, label: "Finishing level analysis" },
+    ).catch(() => "");
+    const outputPeakDb = parseVolumeDb(outputVolumeReport, "max_volume");
+    const outputMeanDb = parseVolumeDb(outputVolumeReport, "mean_volume");
     fs.rmSync(tmpDir, { recursive: true, force: true });
     res.writeHead(200, { "Content-Type": format === "wav" ? "audio/wav" : "audio/mpeg",
       "X-Source-Duration-Ms": String(sourceDurationMs), "X-Output-Duration-Ms": String(outputDurationMs),
-      "X-Trim-Start-Ms": String(startMs), "X-Trim-End-Ms": String(endMs), "X-Tail-Pad-Ms": String(tailPadMs) });
+      "X-Trim-Start-Ms": String(startMs), "X-Trim-End-Ms": String(endMs), "X-Tail-Pad-Ms": String(tailPadMs),
+      "X-Pitch-Semitones": pitchSemitones.toFixed(2), "X-Applied-Gain-Db": gainDb.toFixed(2),
+      "X-Peak-Ceiling-Dbfs": PEAK_CEILING_DBFS.toFixed(2),
+      ...(Number.isFinite(outputPeakDb) ? { "X-Output-Peak-Dbfs": outputPeakDb.toFixed(2) } : {}),
+      ...(Number.isFinite(outputMeanDb) ? { "X-Output-Mean-Dbfs": outputMeanDb.toFixed(2) } : {}) });
     res.end(outputBuffer);
   } catch (err) {
     console.error("[trim] Error:", err.message);
@@ -993,12 +1076,17 @@ const server = http.createServer(async (req, res) => {
   // meaningful for the worker's readiness gate and any future export drift.
   if (req.method === "GET" && req.url === "/health") {
     const contract = checkModuleContract();
+    const filterCaps = await getFilterCaps();
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({
       status: "ok",
       build_tag: BUILD_TAG,
       contract_ok: contract.ok,
       contract_missing: contract.missing,
+      // Capability truth for callers that must decide whether to OFFER a control
+      // (formant-preserving pitch) rather than discover it at render time.
+      filters: filterCaps,
+      rubberband_available: filterCaps.rubberband,
       mix_lane: getMixLaneStatus(),
     }));
   }
