@@ -45,7 +45,7 @@ const s3signer = require("./s3-signer");
 const { presignS3Url, putS3Object, storageFromEnv, storageFromExplicit } = s3signer;
 const { routeMixFinal, getMixLaneStatus } = require("./mixFinal");
 const { routeMuxVideo } = require("./muxVideo");
-const { routeProxyGen } = require("./proxyGenerator");
+const { routeProxyGen, routeMediaProbe } = require("./proxyGenerator");
 const { routeHlsIngest } = require("./hlsIngest");
 const { routeHashFile } = require("./hashFile");
 const { routeBurnSubtitles } = require("./burnSubtitles");
@@ -132,7 +132,7 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-09-02-pre-export-audio-qc-v1";
+const BUILD_TAG = "extractor-2026-09-02-media-probe-v1";
 
 // ── FILTER CAPABILITY PROBE (enterprise-grade — SOC 2 CC7.2) ─────────────────
 // Formant-preserving pitch requires an ffmpeg built with librubberband, and the
@@ -1089,6 +1089,7 @@ route({ method: "POST", path: "/concat", handler: handleConcat });
 route(routeMixFinal);
 route(routeMuxVideo);
 route(routeProxyGen);
+route(routeMediaProbe);
 route(routeHlsIngest);
 route(routeHashFile);
 route(routeBurnSubtitles);
