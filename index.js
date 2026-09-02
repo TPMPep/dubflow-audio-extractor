@@ -132,7 +132,7 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-08-18-take-finishing-pitch-gain-v1";
+const BUILD_TAG = "extractor-2026-09-02-pre-export-audio-qc-v1";
 
 // ── FILTER CAPABILITY PROBE (enterprise-grade — SOC 2 CC7.2) ─────────────────
 // Formant-preserving pitch requires an ffmpeg built with librubberband, and the
@@ -902,6 +902,34 @@ async function handleSilenceDetect(req, res, API_KEY) {
   }
 }
 
+// ── Advisory pre-export signal analysis ──────────────────────────────────────
+async function handleAudioQC(req, res, API_KEY) {
+  const chunks = []; for await (const chunk of req) chunks.push(chunk);
+  const body = JSON.parse(Buffer.concat(chunks).toString());
+  const token = (req.headers["authorization"] || "").replace("Bearer ", "");
+  if (token !== API_KEY && body.api_key !== API_KEY) { res.writeHead(401); return res.end(JSON.stringify({ error: "Unauthorized" })); }
+  if (!body.audio_url) { res.writeHead(400); return res.end(JSON.stringify({ error: "audio_url required" })); }
+  const tmpDir = fs.mkdtempSync('/tmp/audio_qc_'); const inputFile = `${tmpDir}/input`;
+  try {
+    const source = await fetch(body.audio_url); if (!source.ok) throw new Error(`Download failed: ${source.status}`);
+    fs.writeFileSync(inputFile, Buffer.from(await source.arrayBuffer()));
+    const probeRaw = await runFfprobe(["-v","quiet","-print_format","json","-show_format","-show_streams",inputFile], { timeoutMs: 15000 });
+    const probe = JSON.parse(probeRaw || '{}'); const stream = (probe.streams || []).find(s => s.codec_type === 'audio') || {};
+    const volume = await runFfmpeg(["-hide_banner","-nostdin","-i",inputFile,"-af","volumedetect","-f","null","-"], { timeoutMs: 30000, label: "QC level analysis" });
+    const loudness = await runFfmpeg(["-hide_banner","-nostdin","-i",inputFile,"-af","ebur128=peak=true","-f","null","-"], { timeoutMs: 30000, label: "QC loudness analysis" });
+    const stats = await runFfmpeg(["-hide_banner","-nostdin","-i",inputFile,"-af","astats=metadata=0:reset=0","-f","null","-"], { timeoutMs: 30000, label: "QC signal analysis" });
+    const silence = await runFfmpeg(["-hide_banner","-nostdin","-i",inputFile,"-af","silencedetect=noise=-45dB:d=0.02","-f","null","-"], { timeoutMs: 30000, label: "QC tail analysis" });
+    const last = (text, regex) => { const found=[...String(text||'').matchAll(regex)]; return found.length ? Number(found[found.length-1][1]) : null; };
+    const durationSec = Number(probe.format?.duration || stream.duration || 0);
+    const silenceStarts=[...String(silence).matchAll(/silence_start:\s*([\d.]+)/g)].map(m=>Number(m[1]));
+    const silenceEnds=[...String(silence).matchAll(/silence_end:\s*([\d.]+)/g)].map(m=>Number(m[1]));
+    let trailingMs=0; if(silenceStarts.length){const s=silenceStarts[silenceStarts.length-1];const e=silenceEnds[silenceEnds.length-1];if(!Number.isFinite(e)||Math.abs(e-durationSec)<0.05)trailingMs=Math.max(0,Math.round((durationSec-s)*1000));}
+    const bits = Number(stream.bits_per_raw_sample || stream.bits_per_sample || 0) || null;
+    const result={ codec:stream.codec_name||null, sample_rate_hz:Number(stream.sample_rate||0)||null, bit_depth:bits, channels:Number(stream.channels||0)||null, channel_layout:stream.channel_layout||null, duration_ms:Math.round(durationSec*1000), sample_peak_dbfs:parseVolumeDb(volume,"max_volume"), mean_dbfs:parseVolumeDb(volume,"mean_volume"), integrated_lufs:last(loudness,/\bI:\s*(-?[\d.]+)\s*LUFS/g), loudness_range_lu:last(loudness,/\bLRA:\s*([\d.]+)\s*LU/g), true_peak_dbtp:last(loudness,/\bPeak:\s*(-?[\d.]+)\s*dBFS/g), dc_offset:last(stats,/DC offset:\s*(-?[\d.eE+-]+)/g), trailing_silence_ms:trailingMs, analyzer:"ffmpeg:volumedetect+ebur128+astats+silencedetect", advisory_only:true };
+    fs.rmSync(tmpDir,{recursive:true,force:true}); res.writeHead(200,{"Content-Type":"application/json"}); res.end(JSON.stringify(result));
+  } catch(err) { try{fs.rmSync(tmpDir,{recursive:true,force:true});}catch(_){} res.writeHead(500,{"Content-Type":"application/json"}); res.end(JSON.stringify({error:err.message})); }
+}
+
 // ── Normalize a voice sample for ElevenLabs cloning ──
 // Downloads source from a signed URL, runs denoise + loudness normalization,
 // uploads the result as 44.1kHz mono 16-bit WAV back to S3.
@@ -1055,6 +1083,7 @@ route({ method: "POST", path: "/time-stretch", handler: handleTimeStretch });
 route({ method: "POST", path: "/process", handler: handleProcess });
 route({ method: "POST", path: "/trim", handler: handleTrim });
 route({ method: "POST", path: "/silence-detect", handler: handleSilenceDetect });
+route({ method: "POST", path: "/audio-qc", handler: handleAudioQC });
 route({ method: "POST", path: "/normalize-voice-sample", handler: handleNormalizeVoiceSample });
 route({ method: "POST", path: "/concat", handler: handleConcat });
 route(routeMixFinal);
