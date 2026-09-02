@@ -99,29 +99,49 @@ async function probeSourceMetadata(sourceUrl) {
     const probe = await runProcess("ffprobe", [
       "-v", "error",
       "-select_streams", "v:0",
-      "-show_entries", "format=duration:stream=r_frame_rate",
+      "-show_entries", "format=duration:stream=r_frame_rate,codec_name,width,height",
       "-of", "json",
       sourceUrl,
     ], { timeoutMs: 60_000 });
     if (probe.status !== 0) return { frame_rate: null, duration_ms: null };
     const parsed = JSON.parse(String(probe.stdout || "{}"));
-    const rawRate = String(parsed?.streams?.[0]?.r_frame_rate || "");
+    const stream = parsed?.streams?.[0] || {};
+    const rawRate = String(stream.r_frame_rate || "");
     const match = rawRate.match(/^(\d+)\/(\d+)$/);
-    const fps = match && Number(match[2]) > 0
-      ? Number(match[1]) / Number(match[2])
-      : Number(rawRate);
+    const fps = match && Number(match[2]) > 0 ? Number(match[1]) / Number(match[2]) : Number(rawRate);
     const durationSec = Number(parsed?.format?.duration);
     return {
-      frame_rate: Number.isFinite(fps) && fps > 0 && fps <= 240
-        ? Math.round(fps * 1000) / 1000
-        : null,
-      duration_ms: Number.isFinite(durationSec) && durationSec > 0
-        ? Math.round(durationSec * 1000)
-        : null,
+      frame_rate: Number.isFinite(fps) && fps > 0 && fps <= 240 ? Math.round(fps * 1000) / 1000 : null,
+      duration_ms: Number.isFinite(durationSec) && durationSec > 0 ? Math.round(durationSec * 1000) : null,
+      codec: stream.codec_name || null,
+      width: Number(stream.width) || null,
+      height: Number(stream.height) || null,
     };
   } catch {
     return { frame_rate: null, duration_ms: null };
   }
+}
+
+async function handleMediaProbe(req, res, API_KEY) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  let body;
+  try { body = JSON.parse(Buffer.concat(chunks).toString()); }
+  catch { res.writeHead(400); return res.end(JSON.stringify({ error: "bad JSON" })); }
+  const token = String(req.headers.authorization || "").replace("Bearer ", "");
+  if (token !== API_KEY && body.api_key !== API_KEY) {
+    res.writeHead(401); return res.end(JSON.stringify({ error: "Unauthorized" }));
+  }
+  if (!body.project_id || !body.source_url) {
+    res.writeHead(400); return res.end(JSON.stringify({ error: "project_id and source_url required" }));
+  }
+  const metadata = await probeSourceMetadata(body.source_url);
+  if (!metadata.duration_ms) {
+    res.writeHead(503, { "Content-Type": "application/json", "Retry-After": "15" });
+    return res.end(JSON.stringify({ error: "media_probe_unavailable", retryable: true }));
+  }
+  res.writeHead(200, { "Content-Type": "application/json" });
+  return res.end(JSON.stringify(metadata));
 }
 // Zero-dependency WebCrypto SigV4 signer (replaces @aws-sdk/@smithy — incident
 // 2026-07-07/08). STS session-token aware. See ./s3-signer.js.
@@ -178,6 +198,14 @@ async function handleProxyGenSync(req, res, API_KEY) {
   const sourceHost = (() => {
     try { return new URL(source_url).host; } catch { return "unparseable"; }
   })();
+  // Admission truth is measured before consuming a heavy lane. Oversized-duration
+  // sources are rejected without starting FFmpeg; metadata failure remains
+  // non-blocking here because the independent media-probe queue will retry it.
+  const sourceMetadata = await probeSourceMetadata(source_url);
+  if (Number(sourceMetadata.duration_ms) > 4 * 60 * 60 * 1000) {
+    res.writeHead(413, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ error: "media_duration_exceeded", message: "Source exceeds the 4-hour project limit.", project_id }));
+  }
 
   // ── Acquire a heavy-lane slot (FAST-503) ──
   // All validation above is cheap and slot-free. Only the memory-heavy
@@ -311,10 +339,6 @@ async function handleProxyGenSync(req, res, API_KEY) {
       }));
     }
 
-    // Probe source truth once: duration drives whole-program preflight sampling;
-    // frame rate drives frame-counted caption exports.
-    const sourceMetadata = await probeSourceMetadata(source_url);
-
     const storage = storageFromEnv({ region, bucket, prefix: credential_secret_prefix });
     // STREAMING uploads — never load the proxy into RAM (the OOM cure). Each
     // proxy streams from disk → S3 with a bounded ~64KB footprint regardless of
@@ -372,7 +396,8 @@ async function handleProxyGenSync(req, res, API_KEY) {
   }
 }
 
-// Route descriptor — registered once in index.js's single route table.
+// Route descriptors — registered once in index.js's single route table.
 const routeProxyGen = { method: "POST", path: "/generate-proxy-sync", handler: handleProxyGenSync };
+const routeMediaProbe = { method: "POST", path: "/probe-media", handler: handleMediaProbe };
 
-module.exports = { routeProxyGen };
+module.exports = { routeProxyGen, routeMediaProbe };
