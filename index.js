@@ -132,7 +132,46 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-09-02-media-probe-v1";
+const BUILD_TAG = "extractor-2026-09-03-burn-fonts-v1";
+
+// ── FONT CAPABILITY PROBE (enterprise-grade — SOC 2 CC7.2) ───────────────────
+// A hardsub burn resolves its font through fontconfig. When a font is missing,
+// libass does NOT fail — it renders tofu boxes (□□□) and ffmpeg still exits 0,
+// so the pipeline reports success and hands the customer an unusable MP4 with
+// nothing on the audit row to say why. That is strictly worse than a hard error.
+//
+// This probes `fc-list` ONCE, caches it, and exposes the result on /health so a
+// deploy that lost the font layer is provable from the health endpoint instead
+// of being discovered by an operator watching a Korean burn come back blank.
+// A Dockerfile-only change does not move BUILD_TAG on its own, which is exactly
+// why the capability itself — not just the tag — is reported here.
+let _fontCaps = null;
+async function getFontCaps() {
+  if (_fontCaps) return _fontCaps;
+  const listing = await new Promise((resolve) => {
+    const child = spawn("fc-list", [":", "family"], { stdio: ["ignore", "pipe", "ignore"] });
+    let out = "";
+    let settled = false;
+    const done = () => { if (settled) return; settled = true; clearTimeout(t); resolve(out); };
+    const t = setTimeout(() => { try { child.kill("SIGKILL"); } catch (_) { /* gone */ } done(); }, 10000);
+    child.stdout.on("data", (d) => { out += d.toString(); });
+    child.on("error", done);
+    child.on("close", done);
+  });
+  _fontCaps = {
+    // fontconfig itself present and answering at all.
+    fontconfig: listing.length > 0,
+    // The Latin face every burn style resolves to by default.
+    liberation: /Liberation Sans/i.test(listing),
+    // The fallback that makes Korean / Japanese / Chinese burns render real
+    // glyphs regardless of which family the operator selected.
+    cjk: /Noto Sans CJK|Noto Serif CJK/i.test(listing),
+    // Arabic / Hebrew / Thai / Devanagari / Vietnamese coverage.
+    noto_core: /Noto Sans\b/i.test(listing),
+    family_count: listing.split("\n").filter(Boolean).length,
+  };
+  return _fontCaps;
+}
 
 // ── FILTER CAPABILITY PROBE (enterprise-grade — SOC 2 CC7.2) ─────────────────
 // Formant-preserving pitch requires an ffmpeg built with librubberband, and the
@@ -1107,6 +1146,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/health") {
     const contract = checkModuleContract();
     const filterCaps = await getFilterCaps();
+    const fontCaps = await getFontCaps();
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({
       status: "ok",
@@ -1117,6 +1157,10 @@ const server = http.createServer(async (req, res) => {
       // (formant-preserving pitch) rather than discover it at render time.
       filters: filterCaps,
       rubberband_available: filterCaps.rubberband,
+      // Burn-in readiness. fonts.cjk=false means a Korean/Japanese/Chinese
+      // hardsub will render empty boxes while still returning a valid MP4.
+      fonts: fontCaps,
+      burn_in_ready: fontCaps.fontconfig && fontCaps.liberation && fontCaps.cjk,
       mix_lane: getMixLaneStatus(),
     }));
   }
