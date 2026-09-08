@@ -132,7 +132,7 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-09-03-burn-fonts-v1";
+const BUILD_TAG = "extractor-2026-09-08-speech-aware-fit-v1";
 
 // ── FONT CAPABILITY PROBE (enterprise-grade — SOC 2 CC7.2) ───────────────────
 // A hardsub burn resolves its font through fontconfig. When a font is missing,
@@ -405,6 +405,67 @@ async function handleExtract(req, res, API_KEY) {
   }
 }
 
+// ── Measure the SPEECH SPAN of a clip (leading / trailing silence) ───────────
+// Shared by /silence-detect (pickup trimming) and the speech-aware time-fit.
+// Returns null when nothing usable could be measured, so every caller treats a
+// failed measurement as "assume the whole file is speech" rather than trimming
+// on a guess.
+//
+// WHY THE TIME-FIT NEEDS THIS. A provider render is not all speech. ElevenLabs
+// v3 in particular returns a container far longer than the words it contains
+// (measured: a 25-character line came back as a 3,440ms file for ~1,150ms of
+// speech). The fit used to divide TOTAL file duration by the target window, so
+// that padding was treated as dialogue that had to be crammed in — a 2.4×
+// squeeze on a line that already fitted. The words paid for silence.
+//
+// Thresholds are deliberately conservative: -40dB is well below speech level, so
+// a span this rejects contains no audible dialogue, and a 150ms floor keeps a
+// natural inter-word gap from being read as an edge silence.
+async function measureSpeechSpan(inputFile, durationSec, { thresholdDb = -40, minSilenceSec = 0.15 } = {}) {
+  const stderr = await new Promise((resolve) => {
+    const child = spawn("ffmpeg",
+      ["-hide_banner", "-nostdin", "-i", inputFile, "-af", `silencedetect=noise=${thresholdDb}dB:d=${minSilenceSec}`, "-f", "null", "-"],
+      { stdio: ["ignore", "ignore", "pipe"] });
+    let buf = "";
+    let settled = false;
+    const done = () => { if (settled) return; settled = true; clearTimeout(timer); resolve(buf); };
+    const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch (_) { /* gone */ } done(); }, 20000);
+    child.stderr.on("data", (d) => { buf += d.toString(); });
+    child.on("error", done);
+    child.on("close", done);
+  });
+  if (!Number.isFinite(durationSec) || durationSec <= 0) return null;
+  const starts = [...String(stderr).matchAll(/silence_start:\s*(-?[\d.]+)/g)].map((m) => Number(m[1]));
+  const ends = [...String(stderr).matchAll(/silence_end:\s*([\d.]+)/g)].map((m) => Number(m[1]));
+
+  // Leading silence only counts when the FIRST detected silence begins at the
+  // very top of the file; a silence starting later is an internal pause and must
+  // never be trimmed (that would cut real dialogue).
+  let leading = 0;
+  if (starts.length && starts[0] <= 0.05 && Number.isFinite(ends[0])) leading = Math.max(0, ends[0]);
+
+  // Trailing silence only counts when the LAST detected silence runs to the end
+  // of the file (silencedetect emits no silence_end for it, or an end that lands
+  // at the duration).
+  let trailing = 0;
+  if (starts.length) {
+    const lastStart = starts[starts.length - 1];
+    const lastEnd = ends.length >= starts.length ? ends[starts.length - 1] : NaN;
+    if (!Number.isFinite(lastEnd) || Math.abs(lastEnd - durationSec) < 0.05) {
+      trailing = Math.max(0, durationSec - lastStart);
+    }
+  }
+
+  const speechDurationSec = durationSec - leading - trailing;
+  if (!Number.isFinite(speechDurationSec) || speechDurationSec <= 0) return null;
+  return {
+    speechStartSec: leading,
+    speechDurationSec,
+    leadingSilenceSec: leading,
+    trailingSilenceSec: trailing,
+  };
+}
+
 // ── Time-stretch audio to fit a target duration ──
 async function handleTimeStretch(req, res, API_KEY) {
   const chunks = [];
@@ -422,6 +483,12 @@ async function handleTimeStretch(req, res, API_KEY) {
   // "wav" (lossless pipeline — pcm_s16le, no generational re-encode loss).
   const { audio_url, target_duration_sec, output_format = "mp3" } = body;
   const tsOutFmt = output_format === "wav" ? "wav" : "mp3";
+  // SPEECH-AWARE FITTING (opt-in). When true, the fit ratio is derived from the
+  // clip's SPEECH SPAN rather than its total container length, and speech is
+  // NEVER stretched to fill a window — only compressed when the speech itself
+  // genuinely overruns. The provider's own file is untouched in storage; this
+  // only governs how the DERIVED fitted asset is built.
+  const speechAware = body.speech_aware === true;
   // Untimed TTS may append a short, measured silence guard AFTER the natural
   // take. The dialogue itself stays at its natural duration; only the final
   // container grows, so later lines move rather than clipping this one.
@@ -476,9 +543,49 @@ async function handleTimeStretch(req, res, API_KEY) {
       throw new Error("Could not determine audio duration");
     }
 
-    const ratio = originalDuration / target_duration_sec;
+    // ── SPEECH SPAN ──────────────────────────────────────────────────────────
+    // Legacy (speech_aware absent/false): the whole container is treated as
+    // content, byte-for-byte as before. Speech-aware: measure where the words
+    // actually are, fit THOSE to the window, and let the leftover window be
+    // honest silence instead of compressed padding.
+    let speechStartSec = 0;
+    let speechDurationSec = originalDuration;
+    let leadingSilenceSec = 0;
+    let trailingSilenceSec = 0;
+    let speechMeasured = false;
+    if (speechAware) {
+      const span = await measureSpeechSpan(inputFile, originalDuration);
+      // A span shorter than 50ms is not a credible speech measurement — fall
+      // back to the whole file rather than fitting to noise.
+      if (span && span.speechDurationSec > 0.05) {
+        speechStartSec = span.speechStartSec;
+        speechDurationSec = span.speechDurationSec;
+        leadingSilenceSec = span.leadingSilenceSec;
+        trailingSilenceSec = span.trailingSilenceSec;
+        speechMeasured = true;
+      }
+    }
+
+    // THE RATIO. Speech-aware fitting is deliberately ONE-DIRECTIONAL: clamped
+    // at 1.0 so speech is compressed when it genuinely overruns the window and
+    // otherwise left at its natural pace. Stretching a short take to fill the
+    // window would be just as wrong as squashing it — the source line does not
+    // become slower because the window is generous.
+    const rawRatio = speechDurationSec / target_duration_sec;
+    const ratio = speechMeasured ? Math.max(1, rawRatio) : rawRatio;
+    // Fitted CONTENT length (before the window is padded out). Identical to the
+    // window in legacy mode, so every legacy fade/pad calculation is unchanged.
+    const contentSec = speechMeasured
+      ? Math.min(target_duration_sec, speechDurationSec / ratio)
+      : target_duration_sec;
+    // Trim the measured silence out of the PROCESSED span only. The provider's
+    // original file stays exactly as delivered in storage — this is a derived
+    // asset, so nothing is destroyed and the raw take remains the evidence.
+    const speechInputArgs = speechMeasured
+      ? ["-ss", speechStartSec.toFixed(6), "-t", speechDurationSec.toFixed(6)]
+      : [];
     const finalDurationSec = target_duration_sec + tailPadSec;
-    console.log(`Original: ${originalDuration.toFixed(2)}s, Content target: ${target_duration_sec}s, Final: ${finalDurationSec}s, Ratio: ${ratio.toFixed(3)}`);
+    console.log(`Original: ${originalDuration.toFixed(2)}s, Speech: ${speechDurationSec.toFixed(2)}s (lead ${leadingSilenceSec.toFixed(2)}s / trail ${trailingSilenceSec.toFixed(2)}s, measured=${speechMeasured}), Content target: ${target_duration_sec}s, Content: ${contentSec.toFixed(3)}s, Final: ${finalDurationSec}s, Ratio: ${ratio.toFixed(3)}`);
 
     // Measure the provider take before changing it. volumedetect is one bounded
     // local pass over a short WAV; it gives deterministic sample peak + mean
@@ -517,11 +624,15 @@ async function handleTimeStretch(req, res, API_KEY) {
     // studio 12ms tail fade plus a 60ms silence guard, so a provider take that
     // reaches its final sample decays smoothly to zero without audibly
     // swallowing the last phoneme.
-    const fadeOutStartSec = Math.max(0, target_duration_sec - fadeOutSec);
-    if (fadeInSec > 0 && target_duration_sec > fadeInSec * 2) {
+    // Fades sit at the edges of the SPEECH, not the edges of the window. In
+    // legacy mode contentSec IS the window, so this is unchanged; speech-aware,
+    // it keeps the de-click fade on the last phoneme instead of applying it to
+    // the silence that follows.
+    const fadeOutStartSec = Math.max(0, contentSec - fadeOutSec);
+    if (fadeInSec > 0 && contentSec > fadeInSec * 2) {
       filters.push(`afade=t=in:st=0:d=${fadeInSec.toFixed(4)}:curve=tri`);
     }
-    if (fadeOutSec > 0 && target_duration_sec > fadeOutSec * 2) {
+    if (fadeOutSec > 0 && contentSec > fadeOutSec * 2) {
       filters.push(`afade=t=out:st=${fadeOutStartSec.toFixed(4)}:d=${fadeOutSec.toFixed(4)}:curve=tri`);
     }
     if (appliedGainDb < -0.01) filters.push(`volume=${appliedGainDb.toFixed(2)}dB`);
@@ -541,7 +652,7 @@ async function handleTimeStretch(req, res, API_KEY) {
     // Lossless path encodes pcm_s16le WAV; legacy path keeps lame MP3.
     const tsCodecArgs = tsOutFmt === "wav" ? ["-c:a", "pcm_s16le"] : ["-c:a", "libmp3lame", "-q:a", "2"];
     await runFfmpeg(
-      ["-y", "-i", inputFile, "-filter:a", filterStr, "-vn", ...tsCodecArgs, outputFile],
+      ["-y", ...speechInputArgs, "-i", inputFile, "-filter:a", filterStr, "-vn", ...tsCodecArgs, outputFile],
       { timeoutMs: 30000, label: "Time-stretch" },
     );
 
@@ -556,10 +667,24 @@ async function handleTimeStretch(req, res, API_KEY) {
     // callers that ignore them. ffprobe on the output must NEVER fail the
     // (already-successful) audio response: a probe error degrades the
     // output-duration header to absent, not the whole request.
+    // Speech-span evidence travels with the asset so the caller can persist WHY
+    // this clip was (or was not) compressed, and by how much. X-Speech-Measured
+    // is explicit: absent/false means the span was never established and the
+    // legacy whole-container ratio was used, which is different information from
+    // "there was no silence".
     const durationHeaders = {
       "X-Applied-Gain-Db": appliedGainDb.toFixed(2),
       "X-Tail-Pad-Ms": String(Math.round(tailPadMs)),
+      "X-Speech-Aware": speechAware ? "1" : "0",
+      "X-Speech-Measured": speechMeasured ? "1" : "0",
+      "X-Fit-Ratio": ratio.toFixed(6),
     };
+    if (speechMeasured) {
+      durationHeaders["X-Speech-Duration-Ms"] = String(Math.round(speechDurationSec * 1000));
+      durationHeaders["X-Speech-Start-Ms"] = String(Math.round(speechStartSec * 1000));
+      durationHeaders["X-Leading-Silence-Ms"] = String(Math.round(leadingSilenceSec * 1000));
+      durationHeaders["X-Trailing-Silence-Ms"] = String(Math.round(trailingSilenceSec * 1000));
+    }
     if (Number.isFinite(inputPeakDb)) durationHeaders["X-Input-Peak-Dbfs"] = inputPeakDb.toFixed(2);
     if (Number.isFinite(inputMeanDb)) durationHeaders["X-Input-Mean-Dbfs"] = inputMeanDb.toFixed(2);
     if (Number.isFinite(originalDuration) && originalDuration > 0) {
