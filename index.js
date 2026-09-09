@@ -132,7 +132,7 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-09-08-speech-aware-fit-v1";
+const BUILD_TAG = "extractor-2026-09-09-signal-integrity-qc-v1";
 
 // ── FONT CAPABILITY PROBE (enterprise-grade — SOC 2 CC7.2) ───────────────────
 // A hardsub burn resolves its font through fontconfig. When a font is missing,
@@ -1066,14 +1066,100 @@ async function handleSilenceDetect(req, res, API_KEY) {
   }
 }
 
-// ── Advisory pre-export signal analysis ──────────────────────────────────────
+// ── Advisory pre-export SIGNAL INTEGRITY analysis ────────────────────────────
+// This endpoint answers exactly one question: is the audio technically clean
+// enough to ship? Clipping, edge clicks, a cut-off tail, internal glitches,
+// level/loudness and container format. It deliberately says NOTHING about
+// delivery speed, time-fit or reading rate — those are editorial judgements the
+// operator has already made upstream, and folding them into a technical gate is
+// what made the gate impossible to trust.
+//
+// EVERYTHING HERE IS MEASURED, NEVER INFERRED. That distinction is the whole
+// point of this pass: peak level alone cannot tell a correctly limited master
+// (peaking at -0.05 dBFS with one sample there) from a genuinely distorting one
+// (4,000 consecutive samples pinned at full scale). astats counts those samples,
+// so we report the count and let the caller judge it.
+const QC_EDGE_WINDOW_SEC = 0.002;   // 2ms ≈ 96 samples at 48k — the boundary itself
+const QC_GLITCH_HIGHPASS_HZ = 6000; // a click is broadband; speech up here is not
+
+// astats prints one block PER CHANNEL and the "Overall" block LAST, so the last
+// match is always the whole-file figure. Returns null for a missing or
+// non-finite value (inf/nan) rather than a number that looks measured.
+function lastAstatsValue(report, label) {
+  const found = [...String(report || "").matchAll(new RegExp(`${label}:\\s*(-?[\\d.eE+-]+|-?inf|nan)`, "g"))];
+  if (!found.length) return null;
+  const num = Number(found[found.length - 1][1]);
+  return Number.isFinite(num) ? num : null;
+}
+
+// Peak level of a tiny window at a clip boundary. A clip whose first or last
+// samples sit near the clip's own peak has no fade and WILL click on playback —
+// this is the direct measurement of that, rather than trusting that the fitting
+// pass's micro-fades landed.
+async function measureEdgePeakDb(inputFile, startSec, durSec) {
+  const report = await runFfmpeg(
+    ["-hide_banner", "-nostdin", "-ss", startSec.toFixed(6), "-t", durSec.toFixed(6), "-i", inputFile,
+      "-af", "astats=metadata=0:reset=0", "-f", "null", "-"],
+    { timeoutMs: 15000, label: "QC edge analysis" },
+  ).catch(() => "");
+  return lastAstatsValue(report, "Peak level dB");
+}
+
+// FULL WINDOWED GLITCH SCAN. High-pass at 6 kHz (speech carries little energy up
+// there, a click carries all of it), then astats with reset=1 emits per-frame
+// stats (~20ms windows) which ametadata writes to a file. A window whose
+// high-frequency peak towers over the clip's OWN median is a click, a pop or a
+// digital glitch — measured relative to the clip so a bright voice and a dull one
+// are judged on the same footing.
+//
+// Returns the window count, the median, and the WORST TEN offenders only. The
+// caller thresholds them: judgement policy lives with the run's pinned policy,
+// never here, so a policy change never requires an extractor redeploy.
+async function scanGlitchWindows(inputFile, metaFile) {
+  const empty = { window_count: 0, median_dbfs: null, peaks: [] };
+  await runFfmpeg(
+    ["-hide_banner", "-nostdin", "-i", inputFile,
+      "-af", `highpass=f=${QC_GLITCH_HIGHPASS_HZ},astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.Peak_level:file=${metaFile}`,
+      "-f", "null", "-"],
+    { timeoutMs: 90000, label: "QC glitch scan" },
+  ).catch(() => null);
+  let text = "";
+  try { text = fs.readFileSync(metaFile, "utf8"); } catch (_) { return empty; }
+  const windows = [];
+  let pendingT = null;
+  for (const line of String(text).split("\n")) {
+    const stamp = line.match(/pts_time:\s*([\d.]+)/);
+    if (stamp) { pendingT = Number(stamp[1]); continue; }
+    const value = line.match(/Peak_level=\s*(-?[\d.]+|-?inf)/);
+    if (value && pendingT != null) {
+      const db = Number(value[1]);
+      // A silent window is not a transient; it is excluded from the level
+      // statistics entirely so it cannot drag the median down and manufacture
+      // glitches out of ordinary speech.
+      if (Number.isFinite(db)) windows.push({ t_ms: Math.round(pendingT * 1000), dbfs: +db.toFixed(2) });
+      pendingT = null;
+    }
+  }
+  if (!windows.length) return empty;
+  const sorted = windows.map((w) => w.dbfs).sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)];
+  const peaks = windows
+    .map((w) => ({ ...w, over_median_db: +(w.dbfs - median).toFixed(2) }))
+    .sort((a, b) => b.over_median_db - a.over_median_db)
+    .slice(0, 10);
+  return { window_count: windows.length, median_dbfs: +median.toFixed(2), peaks };
+}
+
 async function handleAudioQC(req, res, API_KEY) {
   const chunks = []; for await (const chunk of req) chunks.push(chunk);
   const body = JSON.parse(Buffer.concat(chunks).toString());
   const token = (req.headers["authorization"] || "").replace("Bearer ", "");
   if (token !== API_KEY && body.api_key !== API_KEY) { res.writeHead(401); return res.end(JSON.stringify({ error: "Unauthorized" })); }
   if (!body.audio_url) { res.writeHead(400); return res.end(JSON.stringify({ error: "audio_url required" })); }
-  const tmpDir = fs.mkdtempSync('/tmp/audio_qc_'); const inputFile = `${tmpDir}/input`;
+  // The windowed scan is the DEFAULT, not an opt-in: a pre-delivery gate that
+  // skips the deepest check by default is a gate that misses things.
+  const deepScan = body.deep_scan !== false;
+  const tmpDir = fs.mkdtempSync('/tmp/audio_qc_'); const inputFile = `${tmpDir}/input`; const metaFile = `${tmpDir}/hf-windows.txt`;
   try {
     const source = await fetch(body.audio_url); if (!source.ok) throw new Error(`Download failed: ${source.status}`);
     fs.writeFileSync(inputFile, Buffer.from(await source.arrayBuffer()));
@@ -1085,11 +1171,62 @@ async function handleAudioQC(req, res, API_KEY) {
     const silence = await runFfmpeg(["-hide_banner","-nostdin","-i",inputFile,"-af","silencedetect=noise=-45dB:d=0.02","-f","null","-"], { timeoutMs: 30000, label: "QC tail analysis" });
     const last = (text, regex) => { const found=[...String(text||'').matchAll(regex)]; return found.length ? Number(found[found.length-1][1]) : null; };
     const durationSec = Number(probe.format?.duration || stream.duration || 0);
+
+    // ── SILENCE STRUCTURE ──
+    // One silencedetect pass answers two different questions: how much decay is
+    // left at the tail, and whether any suspiciously SHORT digital gap sits in
+    // the middle of the take. Mid-file runs are reported raw — the caller
+    // decides which are too brief to be an intentional pause, because a long
+    // gap in a TTS render is normal and flagging it would be a false positive.
     const silenceStarts=[...String(silence).matchAll(/silence_start:\s*([\d.]+)/g)].map(m=>Number(m[1]));
     const silenceEnds=[...String(silence).matchAll(/silence_end:\s*([\d.]+)/g)].map(m=>Number(m[1]));
     let trailingMs=0; if(silenceStarts.length){const s=silenceStarts[silenceStarts.length-1];const e=silenceEnds[silenceEnds.length-1];if(!Number.isFinite(e)||Math.abs(e-durationSec)<0.05)trailingMs=Math.max(0,Math.round((durationSec-s)*1000));}
+    const internalRuns=[];
+    for(let i=0;i<silenceStarts.length;i+=1){
+      const start=silenceStarts[i]; const end=silenceEnds[i];
+      if(!Number.isFinite(end)) continue;                       // the trailing run, handled above
+      if(start<=0.05) continue;                                  // leading silence, not a dropout
+      if(durationSec&&end>=durationSec-0.05) continue;            // touches the tail
+      internalRuns.push({ start_ms: Math.round(start*1000), duration_ms: Math.round((end-start)*1000) });
+    }
+
+    // ── EDGE BOUNDARIES ──
+    const headEdgeDb = await measureEdgePeakDb(inputFile, 0, QC_EDGE_WINDOW_SEC);
+    const tailEdgeDb = durationSec > QC_EDGE_WINDOW_SEC * 2
+      ? await measureEdgePeakDb(inputFile, Math.max(0, durationSec - QC_EDGE_WINDOW_SEC), QC_EDGE_WINDOW_SEC)
+      : null;
+
+    // ── FULL WINDOWED SCAN ──
+    const glitch = deepScan ? await scanGlitchWindows(inputFile, metaFile) : { window_count: 0, median_dbfs: null, peaks: [] };
+
+    // ── MEASURED CLIPPING ──
+    // astats "Peak count" is the number of samples sitting AT the measured peak.
+    // That is only clipping when the peak is itself full scale, so the count is
+    // reported as clipping ONLY under that condition — otherwise it is just a
+    // repeated peak in a clean file. "Flat factor" is the corroborating evidence:
+    // it rises with runs of consecutive identical samples, the flat-topped
+    // waveform a limiter or a clipped render leaves behind.
+    const maxLevelLinear = lastAstatsValue(stats, "Max level");
+    const peakCount = lastAstatsValue(stats, "Peak count");
+    const isFullScale = Number.isFinite(maxLevelLinear) && Math.abs(maxLevelLinear) >= 0.9995;
+    const clippedSamples = isFullScale && Number.isFinite(peakCount) ? Math.round(peakCount) : 0;
+
     const bits = Number(stream.bits_per_raw_sample || stream.bits_per_sample || 0) || null;
-    const result={ codec:stream.codec_name||null, sample_rate_hz:Number(stream.sample_rate||0)||null, bit_depth:bits, channels:Number(stream.channels||0)||null, channel_layout:stream.channel_layout||null, duration_ms:Math.round(durationSec*1000), sample_peak_dbfs:parseVolumeDb(volume,"max_volume"), mean_dbfs:parseVolumeDb(volume,"mean_volume"), integrated_lufs:last(loudness,/\bI:\s*(-?[\d.]+)\s*LUFS/g), loudness_range_lu:last(loudness,/\bLRA:\s*([\d.]+)\s*LU/g), true_peak_dbtp:last(loudness,/\bPeak:\s*(-?[\d.]+)\s*dBFS/g), dc_offset:last(stats,/DC offset:\s*(-?[\d.eE+-]+)/g), trailing_silence_ms:trailingMs, analyzer:"ffmpeg:volumedetect+ebur128+astats+silencedetect", advisory_only:true };
+    const result={
+      codec:stream.codec_name||null, sample_rate_hz:Number(stream.sample_rate||0)||null, bit_depth:bits,
+      channels:Number(stream.channels||0)||null, channel_layout:stream.channel_layout||null, duration_ms:Math.round(durationSec*1000),
+      sample_peak_dbfs:parseVolumeDb(volume,"max_volume"), mean_dbfs:parseVolumeDb(volume,"mean_volume"),
+      integrated_lufs:last(loudness,/\bI:\s*(-?[\d.]+)\s*LUFS/g), loudness_range_lu:last(loudness,/\bLRA:\s*([\d.]+)\s*LU/g),
+      true_peak_dbtp:last(loudness,/\bPeak:\s*(-?[\d.]+)\s*dBFS/g), dc_offset:last(stats,/DC offset:\s*(-?[\d.eE+-]+)/g),
+      peak_level_dbfs:lastAstatsValue(stats,"Peak level dB"), max_level_linear:maxLevelLinear,
+      clipped_sample_count:clippedSamples, peak_sample_count:Number.isFinite(peakCount)?Math.round(peakCount):null,
+      flat_factor:lastAstatsValue(stats,"Flat factor"), noise_floor_dbfs:lastAstatsValue(stats,"Noise floor dB"),
+      trailing_silence_ms:trailingMs, internal_silence_runs:internalRuns.slice(0,10),
+      head_edge_peak_dbfs:headEdgeDb, tail_edge_peak_dbfs:tailEdgeDb, edge_window_ms:Math.round(QC_EDGE_WINDOW_SEC*1000),
+      deep_scan:deepScan, hf_window_count:glitch.window_count, hf_median_dbfs:glitch.median_dbfs, hf_peaks:glitch.peaks,
+      hf_highpass_hz:QC_GLITCH_HIGHPASS_HZ,
+      analyzer:"ffmpeg:volumedetect+ebur128+astats+silencedetect+hf-window-scan", advisory_only:true,
+    };
     fs.rmSync(tmpDir,{recursive:true,force:true}); res.writeHead(200,{"Content-Type":"application/json"}); res.end(JSON.stringify(result));
   } catch(err) { try{fs.rmSync(tmpDir,{recursive:true,force:true});}catch(_){} res.writeHead(500,{"Content-Type":"application/json"}); res.end(JSON.stringify({error:err.message})); }
 }
