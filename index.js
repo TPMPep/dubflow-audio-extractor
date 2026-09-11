@@ -132,7 +132,7 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-09-09-signal-integrity-qc-v1";
+const BUILD_TAG = "extractor-2026-09-11-bidirectional-operator-pace-v1";
 
 // ── FONT CAPABILITY PROBE (enterprise-grade — SOC 2 CC7.2) ───────────────────
 // A hardsub burn resolves its font through fontconfig. When a font is missing,
@@ -483,12 +483,13 @@ async function handleTimeStretch(req, res, API_KEY) {
   // "wav" (lossless pipeline — pcm_s16le, no generational re-encode loss).
   const { audio_url, target_duration_sec, output_format = "mp3" } = body;
   const tsOutFmt = output_format === "wav" ? "wav" : "mp3";
-  // SPEECH-AWARE FITTING (opt-in). When true, the fit ratio is derived from the
-  // clip's SPEECH SPAN rather than its total container length, and speech is
-  // NEVER stretched to fill a window — only compressed when the speech itself
-  // genuinely overruns. The provider's own file is untouched in storage; this
-  // only governs how the DERIVED fitted asset is built.
+  // SPEECH-AWARE FITTING (opt-in). Normal automatic fit remains one-directional:
+  // it compresses genuine speech overruns but never slows a naturally short line.
+  // An explicit waveform edge resize sends pace_mode='bidirectional', which
+  // intentionally maps the measured speech span to the operator's target in
+  // either direction. The raw provider take remains untouched in storage.
   const speechAware = body.speech_aware === true;
+  const bidirectionalPace = speechAware && body.pace_mode === "bidirectional";
   // Untimed TTS may append a short, measured silence guard AFTER the natural
   // take. The dialogue itself stays at its natural duration; only the final
   // container grows, so later lines move rather than clipping this one.
@@ -566,13 +567,13 @@ async function handleTimeStretch(req, res, API_KEY) {
       }
     }
 
-    // THE RATIO. Speech-aware fitting is deliberately ONE-DIRECTIONAL: clamped
-    // at 1.0 so speech is compressed when it genuinely overruns the window and
-    // otherwise left at its natural pace. Stretching a short take to fill the
-    // window would be just as wrong as squashing it — the source line does not
-    // become slower because the window is generous.
+    // THE RATIO. Automatic speech-aware fitting is deliberately one-directional,
+    // but a manual waveform resize is an explicit editorial pace instruction and
+    // therefore honors both slowdown (<1) and speed-up (>1), at constant pitch.
     const rawRatio = speechDurationSec / target_duration_sec;
-    const ratio = speechMeasured ? Math.max(1, rawRatio) : rawRatio;
+    const ratio = speechMeasured
+      ? (bidirectionalPace ? rawRatio : Math.max(1, rawRatio))
+      : rawRatio;
     // Fitted CONTENT length (before the window is padded out). Identical to the
     // window in legacy mode, so every legacy fade/pad calculation is unchanged.
     const contentSec = speechMeasured
@@ -676,6 +677,7 @@ async function handleTimeStretch(req, res, API_KEY) {
       "X-Applied-Gain-Db": appliedGainDb.toFixed(2),
       "X-Tail-Pad-Ms": String(Math.round(tailPadMs)),
       "X-Speech-Aware": speechAware ? "1" : "0",
+      "X-Pace-Mode": bidirectionalPace ? "bidirectional" : "fit",
       "X-Speech-Measured": speechMeasured ? "1" : "0",
       "X-Fit-Ratio": ratio.toFixed(6),
     };
