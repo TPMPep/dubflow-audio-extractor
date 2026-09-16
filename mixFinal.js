@@ -145,7 +145,14 @@ function buildClipChain(c, inIdx, outLabel, sampleRate, fadeInSec, fadeOutSec) {
   }
   const irInput = Number(c.scene_ir_input_idx);
   if (!Number.isInteger(irInput) || irInput < 1) throw new Error(`scene placement model 3 missing impulse response for ${outLabel}`);
-  return `${prefix}[${outLabel}processed];[${outLabel}processed][${irInput}:a]afir=dry=0:wet=1:irfmt=input,${suffix}`;
+  // prefix normally ends in a comma because each optional DSP fragment is built
+  // as a filter followed by its separator. Model 3+ attaches an OUTPUT LABEL at
+  // this point, not another filter; retaining that separator creates an empty
+  // filter (",[label]") and FFmpeg fails the entire batch with
+  // "No such filter: ''". Remove exactly that boundary separator while leaving
+  // every filter, parameter and render order unchanged.
+  const labeledPrefix = prefix.endsWith(',') ? prefix.slice(0, -1) : prefix;
+  return `${labeledPrefix}[${outLabel}processed];[${outLabel}processed][${irInput}:a]afir=dry=0:wet=1:irfmt=input,${suffix}`;
 }
 
 // Mix one consecutive batch into a timeline-local intermediate WAV. The caller
@@ -336,7 +343,17 @@ async function handleMixFinal(req, res, API_KEY) {
           : (Number(p.recipe.echo_delay_ms) || 60) * (modelVersion >= 2 ? 3 : 1);
         return Math.max(max, tailMs);
       }, 0);
-      const spanEndMs = Number.isFinite(nextStartMs) ? nextStartMs + (to < localClips.length ? maxTailMs : 0) : durationMs;
+      // A batch boundary may cut through intentional overlapping dialogue. Size
+      // the intermediate for the latest audible end in this batch, not merely
+      // the next batch's first start, so polyphonic clips survive batching.
+      const latestClipEndMs = batch.reduce((latest, clip) => {
+        const heardMs = Number(clip.max_duration_ms) > 0
+          ? Math.min(Number(clip.audio_dur_ms) || Number(clip.max_duration_ms), Number(clip.max_duration_ms))
+          : (Number(clip.audio_dur_ms) || 0);
+        return Math.max(latest, Number(clip.start_ms) + heardMs);
+      }, batchStartMs);
+      const boundaryEndMs = Number.isFinite(nextStartMs) ? nextStartMs : durationMs;
+      const spanEndMs = Math.max(boundaryEndMs, latestClipEndMs) + (to < localClips.length ? maxTailMs : 0);
       const batchEndMs = Math.max(batchStartMs + 1, Math.min(durationMs, spanEndMs));
       const localBatch = batch.map((clip) => ({ ...clip, start_ms: Math.max(0, Number(clip.start_ms) - batchStartMs) }));
       const interFile = `${tmpDir}/inter_${b}.wav`;
