@@ -35,7 +35,10 @@ const fs = require("fs");
 const { createSemaphore } = require("./s3-signer");
 const { buildImpulse, recipeKey, writeFloatWav } = require("./sceneReverb");
 
-const SCENE_RENDER_MODEL_VERSION = 4;
+// Model v5 changes recipe COMPOSITION, not the renderer graph: recipes arrive as
+// frozen flat DSP values and use the same >=4 EQ/convolution path. Advertising v5
+// therefore preserves every v1-v4 artifact while accepting current v5 snapshots.
+const SCENE_RENDER_MODEL_VERSION = 5;
 const DEVICE_EQ_BANDS = {
   telephone: [[1250, 7.5, 1.3]], television: [[650, 6, 1.1], [2800, -2.5, 1.4]],
   broadcast_radio: [[2800, 5, .75], [180, 2, .8]], walkie_talkie: [[1650, 10, 1.8], [850, -4, 1.1]],
