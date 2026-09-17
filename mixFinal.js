@@ -153,10 +153,10 @@ function buildClipChain(c, inIdx, outLabel, sampleRate, fadeInSec, fadeOutSec) {
   // every filter, parameter and render order unchanged.
   const labeledPrefix = prefix.endsWith(',') ? prefix.slice(0, -1) : prefix;
   // Browser parity: Web Audio's ConvolverNode is configured normalize=false.
-  // FFmpeg afir defaults irnorm=1, which silently rescales every impulse response
-  // by its vector norm and changes both level and tone only in the export. Disable
-  // that normalization explicitly; irgain=1 preserves the authored IR coefficients.
-  return `${labeledPrefix}[${outLabel}processed];[${outLabel}processed][${irInput}:a]afir=dry=0:wet=1:irfmt=input:irnorm=-1:irgain=1,${suffix}`;
+  // Disable FFmpeg afir's automatic IR gain with gtype=none. Unlike the newer
+  // irnorm option, gtype is supported by the Railway image's FFmpeg build and
+  // preserves the authored coefficients when paired with irgain=1.
+  return `${labeledPrefix}[${outLabel}processed];[${outLabel}processed][${irInput}:a]afir=dry=0:wet=1:irfmt=input:gtype=none:irgain=1,${suffix}`;
 }
 
 // Mix one consecutive batch into a timeline-local intermediate WAV. The caller
