@@ -152,7 +152,11 @@ function buildClipChain(c, inIdx, outLabel, sampleRate, fadeInSec, fadeOutSec) {
   // "No such filter: ''". Remove exactly that boundary separator while leaving
   // every filter, parameter and render order unchanged.
   const labeledPrefix = prefix.endsWith(',') ? prefix.slice(0, -1) : prefix;
-  return `${labeledPrefix}[${outLabel}processed];[${outLabel}processed][${irInput}:a]afir=dry=0:wet=1:irfmt=input,${suffix}`;
+  // Browser parity: Web Audio's ConvolverNode is configured normalize=false.
+  // FFmpeg afir defaults irnorm=1, which silently rescales every impulse response
+  // by its vector norm and changes both level and tone only in the export. Disable
+  // that normalization explicitly; irgain=1 preserves the authored IR coefficients.
+  return `${labeledPrefix}[${outLabel}processed];[${outLabel}processed][${irInput}:a]afir=dry=0:wet=1:irfmt=input:irnorm=-1:irgain=1,${suffix}`;
 }
 
 // Mix one consecutive batch into a timeline-local intermediate WAV. The caller
@@ -257,12 +261,12 @@ async function handleMixFinal(req, res, API_KEY) {
   const durationMs = Number(body.duration_ms);
   const outputFormat = (body.output_format || "wav").toLowerCase();
   const sampleRate = Number(body.sample_rate || 48000);
-  // Asymmetric micro-fades on every clip — must match the /time-stretch
-  // fitting pass so the program mix never reintroduces a boundary pop the
-  // fitted clips already suppressed. Defaults: 8ms in, 12ms out.
+  // Symmetric de-click fades on every clip. The editor preview uses the same
+  // 15ms envelope, so a hard head/tail cannot produce an export-only tick when
+  // two authored windows touch. This changes no timecode and removes no audio.
   const _legacyFade = body.fade_ms != null ? Number(body.fade_ms) : null;
-  const fadeInMs = Math.max(0, Math.min(50, Number(body.fade_in_ms ?? _legacyFade ?? 8)));
-  const fadeOutMs = Math.max(0, Math.min(50, Number(body.fade_out_ms ?? _legacyFade ?? 12)));
+  const fadeInMs = Math.max(0, Math.min(50, Number(body.fade_in_ms ?? _legacyFade ?? 15)));
+  const fadeOutMs = Math.max(0, Math.min(50, Number(body.fade_out_ms ?? _legacyFade ?? 15)));
 
   // EBU R128 loudness normalization target (LUFS). -16 streaming / -23 broadcast
   // / null = no normalization. True-peak ceiling always -1 dBTP, LRA 11 LU.
