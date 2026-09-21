@@ -132,7 +132,7 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-09-17-scene-ir-edge-fades-v2";
+const BUILD_TAG = "extractor-2026-09-21-continuous-punch-assemble-v1";
 
 // ── FONT CAPABILITY PROBE (enterprise-grade — SOC 2 CC7.2) ───────────────────
 // A hardsub burn resolves its font through fontconfig. When a font is missing,
@@ -956,6 +956,32 @@ async function handleTrim(req, res, API_KEY) {
   }
 }
 
+// ── Non-destructive continuous-recording punch assembly ─────────────────────
+async function handlePunchAssemble(req, res, API_KEY) {
+  const chunks = []; for await (const chunk of req) chunks.push(chunk);
+  const body = JSON.parse(Buffer.concat(chunks).toString());
+  const token = (req.headers["authorization"] || "").replace("Bearer ", "");
+  if (token !== API_KEY && body.api_key !== API_KEY) { res.writeHead(401); return res.end(JSON.stringify({ error: "Unauthorized" })); }
+  const spans = Array.isArray(body.spans) ? body.spans.map(span => ({ start: Number(span.start_ms), end: Number(span.end_ms) })) : [];
+  if (!body.audio_url || !spans.length || spans.length > 20 || spans.some((span, index) => !Number.isFinite(span.start) || !Number.isFinite(span.end) || span.start < 0 || span.end - span.start < 100 || (index && span.start < spans[index - 1].end))) {
+    res.writeHead(400, { "Content-Type": "application/json" }); return res.end(JSON.stringify({ error: "audio_url and 1-20 ordered, non-overlapping spans are required" }));
+  }
+  const tmpDir = fs.mkdtempSync('/tmp/punch_'); const inputFile = `${tmpDir}/input`; const outputFile = `${tmpDir}/assembled.wav`;
+  try {
+    const source = await fetch(body.audio_url); if (!source.ok) throw new Error(`Download failed: ${source.status}`);
+    fs.writeFileSync(inputFile, Buffer.from(await source.arrayBuffer()));
+    const filters = spans.map((span, index) => `[0:a]atrim=start=${(span.start / 1000).toFixed(6)}:end=${(span.end / 1000).toFixed(6)},asetpts=PTS-STARTPTS[s${index}]`);
+    filters.push(`${spans.map((_, index) => `[s${index}]`).join('')}concat=n=${spans.length}:v=0:a=1[out]`);
+    await runFfmpeg(["-y", "-i", inputFile, "-filter_complex", filters.join(';'), "-map", "[out]", "-ac", "1", "-ar", "48000", "-c:a", "pcm_s24le", outputFile], { timeoutMs: 120000, label: "Punch assembly" });
+    const bytes = fs.readFileSync(outputFile); if (bytes.length < 1024) throw new Error("Punch assembly produced a degenerate file");
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    res.writeHead(200, { "Content-Type": "audio/wav" }); return res.end(bytes);
+  } catch (error) {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) { /* noop */ }
+    res.writeHead(500, { "Content-Type": "application/json" }); return res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
 // ── Auto-detect dead air (silence) at the head and tail of an audio clip ──
 // POST /silence-detect { audio_url, silence_threshold_db?, min_silence_duration_sec? }
 // Returns: { duration_sec, leading_silence_sec, trailing_silence_sec,
@@ -1385,6 +1411,7 @@ route({ method: "POST", path: "/extract", handler: handleExtract });
 route({ method: "POST", path: "/time-stretch", handler: handleTimeStretch });
 route({ method: "POST", path: "/process", handler: handleProcess });
 route({ method: "POST", path: "/trim", handler: handleTrim });
+route({ method: "POST", path: "/punch-assemble", handler: handlePunchAssemble });
 route({ method: "POST", path: "/silence-detect", handler: handleSilenceDetect });
 route({ method: "POST", path: "/audio-qc", handler: handleAudioQC });
 route({ method: "POST", path: "/normalize-voice-sample", handler: handleNormalizeVoiceSample });
