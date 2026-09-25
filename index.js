@@ -132,7 +132,7 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-09-21-continuous-punch-assemble-v1";
+const BUILD_TAG = "extractor-2026-09-25-capture-batch-clips-v1";
 
 // ── FONT CAPABILITY PROBE (enterprise-grade — SOC 2 CC7.2) ───────────────────
 // A hardsub burn resolves its font through fontconfig. When a font is missing,
@@ -229,6 +229,43 @@ function runFfprobe(args, { timeoutMs = 10000 } = {}) {
   });
 }
 
+function clockToSeconds(value) {
+  const match = String(value || "").match(/^(\d+):(\d+):([\d.]+)$/);
+  if (!match) return 0;
+  return Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]);
+}
+
+// Browser MediaRecorder WebM blobs commonly omit a container-level duration.
+// ffprobe then reports N/A even though every audio packet has a valid timestamp.
+// Resolve duration from declared format/stream metadata first, then decode to a
+// null sink and read FFmpeg's final media timestamp. The fallback is measured
+// from the bytes themselves — never from a browser/client claim — and is bounded
+// so a malformed file cannot occupy an extractor process indefinitely.
+async function measureMediaDuration(inputFile, { timeoutMs = 30000 } = {}) {
+  const raw = await runFfprobe([
+    "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", inputFile,
+  ], { timeoutMs: Math.min(timeoutMs, 15000) });
+  try {
+    const probe = JSON.parse(raw || "{}");
+    const audio = (probe.streams || []).find((stream) => stream.codec_type === "audio") || {};
+    const candidates = [probe.format?.duration, audio.duration, audio.tags?.DURATION, probe.format?.tags?.DURATION];
+    for (const candidate of candidates) {
+      const seconds = String(candidate || "").includes(":") ? clockToSeconds(candidate) : Number(candidate);
+      if (Number.isFinite(seconds) && seconds > 0) return { seconds, method: "ffprobe_metadata" };
+    }
+  } catch (_) { /* decode fallback below */ }
+
+  const report = await runFfmpeg(
+    ["-hide_banner", "-nostdin", "-i", inputFile, "-map", "0:a:0", "-f", "null", "-"],
+    { timeoutMs, label: "Audio duration decode" },
+  );
+  const matches = [...String(report).matchAll(/time=(\d+):(\d+):([\d.]+)/g)];
+  const last = matches[matches.length - 1];
+  const seconds = last ? Number(last[1]) * 3600 + Number(last[2]) * 60 + Number(last[3]) : 0;
+  if (!Number.isFinite(seconds) || seconds <= 0) throw new Error("Could not determine audio duration from metadata or decoded timestamps");
+  return { seconds, method: "decoded_timeline" };
+}
+
 // =============================================================================
 // SINGLE EXPLICIT ROUTE TABLE (enterprise-grade — SOC 2 CC7.2).
 // -----------------------------------------------------------------------------
@@ -259,7 +296,7 @@ function route(descriptor) {
 }
 
 // ── Extract speaker audio segments ──
-async function handleExtract(req, res, API_KEY) {
+async function handleExtract(req, res, API_KEY, forceSeparateClips = false) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
   const body = JSON.parse(Buffer.concat(chunks).toString());
@@ -270,17 +307,25 @@ async function handleExtract(req, res, API_KEY) {
   }
 
   const { s3_key, timestamps, speaker_label } = body;
-  if (!s3_key || !timestamps || timestamps.length === 0) {
+  const separate_clips = forceSeparateClips;
+  if (!s3_key || !Array.isArray(timestamps) || timestamps.length === 0) {
     res.writeHead(400);
     return res.end(JSON.stringify({ error: "s3_key and timestamps required" }));
   }
+  // A capture tick needs independent clips, not the legacy concatenated WAV.
+  // Bound the batch so one request cannot monopolize the extractor under load.
+  if (separate_clips && (timestamps.length > 3 || timestamps.some(t => !Number.isFinite(t?.start_ms) || !Number.isFinite(t?.end_ms) || t.end_ms <= t.start_ms || t.end_ms - t.start_ms > 90_000))) {
+    res.writeHead(400);
+    return res.end(JSON.stringify({ error: "separate_clips requires 1–3 valid windows of at most 90 seconds each" }));
+  }
 
+  let tmpDir = null;
   try {
     console.log(`Extracting audio for ${speaker_label || "speaker"} from ${s3_key}, ${timestamps.length} segments`);
 
     const signedUrl = await presignS3Url({ method: "GET", storage, key: s3_key, expiresIn: 3600 });
 
-    const tmpDir = fs.mkdtempSync('/tmp/extract_');
+    tmpDir = fs.mkdtempSync('/tmp/extract_');
     const outputFile = `${tmpDir}/output.wav`;
 
     // ── DOWNLOAD-ONCE, THEN LOCAL MULTI-WINDOW EXTRACT (enterprise-grade) ──
@@ -344,6 +389,25 @@ async function handleExtract(req, res, API_KEY) {
       // variable-rate source can't desync the filtergraph.
       filterParts.push(`[${i}:a]aresample=44100,aformat=channel_layouts=mono[a${i}]`);
     });
+    // Capture analyzes each original window independently. Reuse this single
+    // proxy download and the same local-seek/decoder policy, but produce an
+    // ordered WAV per window instead of concatenating speakers or cue timelines.
+    if (separate_clips) {
+      const clipPaths = valid.map((_, i) => `${tmpDir}/clip_${i}.wav`);
+      const outputs = clipPaths.flatMap((file, i) => ["-map", `[a${i}]`, "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "1", file]);
+      await runFfmpeg(["-y", "-threads", "1", "-fflags", "+genpts", "-err_detect", "ignore_err", ...inputArgs, "-filter_complex", filterParts.join(";"), ...outputs], { timeoutMs: 110000, label: "Batch audio extraction" });
+      const signedUrls = [];
+      for (let i = 0; i < clipPaths.length; i++) {
+        const clip = fs.readFileSync(clipPaths[i]);
+        if (clip.length <= 512) throw new Error(`Extracted clip ${i} is empty`);
+        const key = `dubflow/performance-capture/${speaker_label || "capture"}_${Date.now()}_${i}.wav`;
+        await putS3Object(storage, key, clip, { contentType: "audio/wav" });
+        signedUrls.push(await presignS3Url({ method: "GET", storage, key, expiresIn: 3600 }));
+      }
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ success: true, signed_urls: signedUrls, segment_count: signedUrls.length }));
+    }
     const concatInputs = valid.map((_, i) => `[a${i}]`).join("");
     const filterGraph = `${filterParts.join(";")};${concatInputs}concat=n=${valid.length}:v=0:a=1[out]`;
 
@@ -400,6 +464,7 @@ async function handleExtract(req, res, API_KEY) {
 
   } catch (err) {
     console.error("Extraction error:", err.message);
+    if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
     res.writeHead(500);
     res.end(JSON.stringify({ error: err.message }));
   }
@@ -887,9 +952,9 @@ async function handleTrim(req, res, API_KEY) {
     const downloadRes = await fetch(audio_url);
     if (!downloadRes.ok) throw new Error(`Download failed: ${downloadRes.status}`);
     fs.writeFileSync(inputFile, Buffer.from(await downloadRes.arrayBuffer()));
-    const sourceProbe = await runFfprobe(["-v", "quiet", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", inputFile]);
-    const sourceDurationMs = Math.round((parseFloat(sourceProbe) || 0) * 1000);
-    if (!sourceDurationMs || startMs < 0 || endMs > sourceDurationMs + 20) throw new Error(`Trim window ${startMs}-${endMs}ms is outside source duration ${sourceDurationMs}ms`);
+    const sourceDuration = await measureMediaDuration(inputFile);
+    const sourceDurationMs = Math.round(sourceDuration.seconds * 1000);
+    if (startMs < 0 || endMs > sourceDurationMs + 20) throw new Error(`Trim window ${startMs}-${endMs}ms is outside measured source duration ${sourceDurationMs}ms`);
 
     const contentMs = endMs - startMs;
     const finalMs = contentMs + tailPadMs;
@@ -941,7 +1006,8 @@ async function handleTrim(req, res, API_KEY) {
     const outputMeanDb = parseVolumeDb(outputVolumeReport, "mean_volume");
     fs.rmSync(tmpDir, { recursive: true, force: true });
     res.writeHead(200, { "Content-Type": format === "wav" ? "audio/wav" : "audio/mpeg",
-      "X-Source-Duration-Ms": String(sourceDurationMs), "X-Output-Duration-Ms": String(outputDurationMs),
+      "X-Source-Duration-Ms": String(sourceDurationMs), "X-Source-Duration-Method": sourceDuration.method,
+      "X-Output-Duration-Ms": String(outputDurationMs),
       "X-Trim-Start-Ms": String(startMs), "X-Trim-End-Ms": String(endMs), "X-Tail-Pad-Ms": String(tailPadMs),
       "X-Pitch-Semitones": pitchSemitones.toFixed(2), "X-Applied-Gain-Db": gainDb.toFixed(2),
       "X-Peak-Ceiling-Dbfs": PEAK_CEILING_DBFS.toFixed(2),
@@ -1022,12 +1088,10 @@ async function handleSilenceDetect(req, res, API_KEY) {
     const audioArrayBuffer = await downloadRes.arrayBuffer();
     fs.writeFileSync(inputFile, Buffer.from(audioArrayBuffer));
 
-    // Get total duration (non-blocking probe)
-    const probeOut = await runFfprobe(
-      ["-v", "quiet", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", inputFile],
-    );
-    const durationSec = parseFloat(probeOut);
-    if (!durationSec || durationSec <= 0) throw new Error("Could not determine audio duration");
+    // MediaRecorder WebM may have no container duration, so use the same
+    // measured metadata→decoded-timeline resolver as /trim.
+    const durationMeasurement = await measureMediaDuration(inputFile);
+    const durationSec = durationMeasurement.seconds;
 
     // Run silencedetect via spawn (non-blocking) — the measurements are printed
     // to stderr, so we capture it (ffmpeg exits 0 here; a null muxer produces no
@@ -1080,6 +1144,7 @@ async function handleSilenceDetect(req, res, API_KEY) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       duration_sec: +durationSec.toFixed(3),
+      duration_measurement_method: durationMeasurement.method,
       leading_silence_sec: +leadingSilence.toFixed(3),
       trailing_silence_sec: +trailingSilence.toFixed(3),
       speech_start_sec: +speechStart.toFixed(3),
@@ -1408,6 +1473,7 @@ async function handleConcat(req, res, API_KEY) {
 // Inline handlers (this file) + the six module route descriptors. Order here
 // is irrelevant — dispatch is an O(1) Map lookup, never a listener chain.
 route({ method: "POST", path: "/extract", handler: handleExtract });
+route({ method: "POST", path: "/extract-clips", handler: (req, res, key) => handleExtract(req, res, key, true) });
 route({ method: "POST", path: "/time-stretch", handler: handleTimeStretch });
 route({ method: "POST", path: "/process", handler: handleProcess });
 route({ method: "POST", path: "/trim", handler: handleTrim });
