@@ -132,7 +132,7 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-09-25-capture-batch-clips-v1";
+const BUILD_TAG = "extractor-2026-09-29-export-editor-parity-v2";
 
 // ── FONT CAPABILITY PROBE (enterprise-grade — SOC 2 CC7.2) ───────────────────
 // A hardsub burn resolves its font through fontconfig. When a font is missing,
@@ -1301,7 +1301,14 @@ async function handleAudioQC(req, res, API_KEY) {
     // waveform a limiter or a clipped render leaves behind.
     const maxLevelLinear = lastAstatsValue(stats, "Max level");
     const peakCount = lastAstatsValue(stats, "Peak count");
-    const isFullScale = Number.isFinite(maxLevelLinear) && Math.abs(maxLevelLinear) >= 0.9995;
+    const samplePeakDb = parseVolumeDb(volume, "max_volume");
+    const statsPeakDb = lastAstatsValue(stats, "Peak level dB");
+    // astats Max level may use the PCM sample scale (e.g. 32767), not
+    // normalized 0..1. Peak count is meaningful as a full-scale count only
+    // when BOTH independent measurement filters report a peak at 0 dBFS. Without this
+    // cross-check ordinary peaks (-12 dBFS included) were misreported clipped.
+    const isFullScale = Number.isFinite(samplePeakDb) && samplePeakDb >= -0.01
+      && Number.isFinite(statsPeakDb) && statsPeakDb >= -0.01;
     const clippedSamples = isFullScale && Number.isFinite(peakCount) ? Math.round(peakCount) : 0;
 
     const bits = Number(stream.bits_per_raw_sample || stream.bits_per_sample || 0) || null;
