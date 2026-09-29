@@ -34,6 +34,8 @@ const { pipeline } = require("stream/promises");
 const fs = require("fs");
 const { createSemaphore } = require("./s3-signer");
 const { buildImpulse, recipeKey, writeFloatWav } = require("./sceneReverb");
+const AUDIO_EXPORT_RENDER_CONTRACT = 2;
+const { getAfirNormalization } = require('./afirContract');
 
 // Model v5 changes recipe COMPOSITION, not the renderer graph: recipes arrive as
 // frozen flat DSP values and use the same >=4 EQ/convolution path. Advertising v5
@@ -45,7 +47,7 @@ const DEVICE_EQ_BANDS = {
   intercom: [[2200, 9, 1.2], [720, 3, .9]], earpiece: [[2400, 8, 1.5], [900, -3, 1.1]],
 };
 const MIX_LANE = createSemaphore(Math.max(1, Math.min(8, Number(process.env.MIX_MAX_CONCURRENCY) || 2)));
-function getMixLaneStatus() { return { in_use: MIX_LANE.inUse(), max: MIX_LANE.max, scene_render_model_version: SCENE_RENDER_MODEL_VERSION }; }
+function getMixLaneStatus() { return { in_use: MIX_LANE.inUse(), max: MIX_LANE.max, scene_render_model_version: SCENE_RENDER_MODEL_VERSION, audio_export_render_contract: AUDIO_EXPORT_RENDER_CONTRACT }; }
 
 // Max clips summed in a single intermediate FFmpeg pass. Keeps peak memory
 // bounded regardless of total clip count. 80 is comfortably safe on a small
@@ -106,9 +108,9 @@ const routeMixFinal = { method: "POST", path: "/mix-final", handler: handleMixFi
 // Input label is [<inIdx>:a]; output label is [<outLabel>]. Pulled out so the
 // batched intermediate passes and the (former) single pass share ONE source of
 // truth for render parity.
-function buildClipChain(c, inIdx, outLabel, sampleRate, fadeInSec, fadeOutSec) {
+function buildClipChain(c, inIdx, outLabel, sampleRate, fadeInSec, fadeOutSec, irNormalization = 'gtype=none') {
   const delay = Math.max(0, Math.round(Number(c.start_ms)));
-  const placement = c.scene_placement && c.scene_placement.preset_key !== 'clean' && c.scene_placement.recipe ? c.scene_placement.recipe : null;
+  const placement = c.scene_placement && c.scene_placement.recipe ? c.scene_placement.recipe : null;
   const gainDb = (Number(c.gain_db) || 0) + (Number(placement?.gain_db) || 0);
   const hp = Math.max(20, Math.min(1200, Number(placement?.highpass_hz) || 60));
   const lp = Math.max(1200, Math.min(20000, Number(placement?.lowpass_hz) || 20000));
@@ -128,6 +130,8 @@ function buildClipChain(c, inIdx, outLabel, sampleRate, fadeInSec, fadeOutSec) {
   const stereoPart = placement ? `pan=stereo|c0=${leftSelf.toFixed(3)}*c0+${leftCross.toFixed(3)}*c1|c1=${rightCross.toFixed(3)}*c0+${rightSelf.toFixed(3)}*c1,` : '';
   const rate = Number(c.playback_rate);
   const tempoPart = Number.isFinite(rate) && rate > 0 && Math.abs(rate - 1) > .001 ? `atempo=${Math.max(.5, Math.min(2, rate)).toFixed(4)},` : '';
+  // Rejecting an unknown treatment is safer than silently rendering a dry file.
+  if (c.scene_placement && !c.scene_placement.recipe) throw new Error('Applied scene placement is missing its recipe');
   const maxDurMs = Number(c.max_duration_ms);
   const trimPart = Number.isFinite(maxDurMs) && maxDurMs > 0 ? `atrim=end=${(maxDurMs / 1000).toFixed(4)},` : '';
   const fadeInPart = fadeInSec > 0 ? `afade=t=in:st=0:d=${fadeInSec}:curve=tri,` : '';
@@ -156,7 +160,7 @@ function buildClipChain(c, inIdx, outLabel, sampleRate, fadeInSec, fadeOutSec) {
   // Disable FFmpeg afir's automatic IR gain with gtype=none. Unlike the newer
   // irnorm option, gtype is supported by the Railway image's FFmpeg build and
   // preserves the authored coefficients when paired with irgain=1.
-  return `${labeledPrefix}[${outLabel}processed];[${outLabel}processed][${irInput}:a]afir=dry=0:wet=1:irfmt=input:gtype=none:irgain=1,${suffix}`;
+  return `${labeledPrefix}[${outLabel}processed];[${outLabel}processed][${irInput}:a]afir=dry=1:wet=1:irfmt=input:${irNormalization}:irgain=1,${suffix}`;
 }
 
 // Mix one consecutive batch into a timeline-local intermediate WAV. The caller
@@ -175,7 +179,7 @@ async function mixBatch(clips, durationSec, sampleRate, fadeInSec, fadeOutSec, o
   const irInputs = new Map();
   for (const clip of clips) {
     const placement = clip.scene_placement;
-    if (!placement?.recipe || placement.preset_key === 'clean' || Number(placement.recipe_model_version || 1) < 3 || Number(placement.recipe.room_mix || 0) <= 0) continue;
+    if (!placement?.recipe || Number(placement.recipe_model_version || 1) < 3 || Number(placement.recipe.room_mix || 0) <= 0) continue;
     const key = recipeKey(placement.recipe);
     if (!irInputs.has(key)) {
       const path = `${outFile}.ir_${irInputs.size}.wav`;
@@ -186,10 +190,11 @@ async function mixBatch(clips, durationSec, sampleRate, fadeInSec, fadeOutSec, o
     clip.scene_ir_input_idx = irInputs.get(key).input_idx;
   }
 
+  const irNormalization = irInputs.size ? await getAfirNormalization() : 'gtype=none';
   const filterParts = [`[0:a]aformat=sample_fmts=fltp:sample_rates=${sampleRate}:channel_layouts=stereo[base]`];
   const mixLabels = ["[base]"];
   for (let i = 0; i < clips.length; i++) {
-    filterParts.push(buildClipChain(clips[i], i + 1, `c${i}`, sampleRate, fadeInSec, fadeOutSec));
+    filterParts.push(buildClipChain(clips[i], i + 1, `c${i}`, sampleRate, fadeInSec, fadeOutSec, irNormalization));
     mixLabels.push(`[c${i}]`);
   }
   filterParts.push(
@@ -250,6 +255,10 @@ async function handleMixFinal(req, res, API_KEY) {
     return res.end(JSON.stringify({ error: "Unauthorized" }));
   }
 
+  if (body.render_contract_version != null && Number(body.render_contract_version) !== AUDIO_EXPORT_RENDER_CONTRACT) {
+    res.writeHead(409, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ error: 'unsupported_audio_export_render_contract', supported: AUDIO_EXPORT_RENDER_CONTRACT }));
+  }
   const MAX_CLIPS = 5000;
   const MAX_DURATION_MS = 4 * 3600 * 1000;
   const clips = Array.isArray(body.clips) ? body.clips : [];
@@ -340,7 +349,7 @@ async function handleMixFinal(req, res, API_KEY) {
       // Preserve the full v2 three-tap acoustic tail across batch boundaries.
       const maxTailMs = batch.reduce((max, clip) => {
         const p = clip.scene_placement;
-        if (!p?.recipe || p.preset_key === 'clean' || Number(p.recipe.room_mix || 0) <= 0) return max;
+        if (!p?.recipe || Number(p.recipe.room_mix || 0) <= 0) return max;
         const modelVersion = Number(p.recipe_model_version || 1);
         const tailMs = modelVersion >= 3
           ? Number(p.recipe.pre_delay_ms || 0) + Number(p.recipe.decay_seconds || .35) * 1000
@@ -442,6 +451,7 @@ async function handleMixFinal(req, res, API_KEY) {
     res.writeHead(200, {
       "Content-Type": mime,
       "Content-Length": stat.size,
+      "X-Audio-Export-Render-Contract": String(AUDIO_EXPORT_RENDER_CONTRACT),
       "X-Mix-Duration-Ms": String(durationMs),
       "X-Mix-Clip-Count": String(clips.length),
       "X-Mix-Batch-Count": String(intermediates.length),
@@ -478,4 +488,4 @@ async function handleMixFinal(req, res, API_KEY) {
   }
 }
 
-module.exports = { routeMixFinal, getMixLaneStatus };
+module.exports = { routeMixFinal, getMixLaneStatus, buildClipChain };
