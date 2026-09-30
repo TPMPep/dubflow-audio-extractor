@@ -135,8 +135,7 @@ async function handleMuxVideo(req, res, API_KEY) {
     res.writeHead(400); return res.end(JSON.stringify({ error: "audio_codec must be aac or ac3" }));
   }
 
-  const tmpDir = `/tmp/mux_${Date.now()}`;
-  fs.mkdirSync(tmpDir, { recursive: true });
+  const tmpDir = fs.mkdtempSync('/tmp/mux_');
   const videoFile = `${tmpDir}/source_video`;
   const audioFile = `${tmpDir}/mixed_audio.wav`;
   const outputFile = `${tmpDir}/out.${outputFormat}`;
@@ -161,10 +160,10 @@ async function handleMuxVideo(req, res, API_KEY) {
     // -map 1:a:0  → take the mixed audio as the new audio track
     // -c:v copy   → video stream passed through untouched (lossless, fast)
     // -c:a <codec> → re-encode the WAV mix into the container's audio codec
-    // -shortest   → clamp to the shorter of (video, audio). The mix is already
-    //               TC-locked to the program duration so they match; -shortest
-    //               guards against a 1-frame tail mismatch producing a dangling
-    //               silent/black tail.
+    // Pad audio indefinitely, so -shortest terminates ONLY at video EOF.
+    // Never use project/transcript duration or -t to cut copied picture frames.
+    // Both duration and frame count are measured again before returning bytes.
+    const sourceVideo = await probeMuxVideo(videoFile);
     // -movflags +faststart → web-playable MP4 (moov atom at the front).
     const args = [
       "-y", "-hide_banner", "-loglevel", "warning", "-nostdin",
@@ -176,6 +175,7 @@ async function handleMuxVideo(req, res, API_KEY) {
       "-c:a", audioCodec,
       "-b:a", audioBitrate,
       "-ac", "2",
+      "-af", "apad",
       "-shortest",
       "-movflags", "+faststart",
       outputFile,
@@ -194,14 +194,9 @@ async function handleMuxVideo(req, res, API_KEY) {
       return res.end(JSON.stringify({ error: "ffmpeg mux failed", kind: err.kind || "ffmpeg_error", signal: err.signal || null, stderr_tail: stderrTail }));
     }
 
-    // Probe the output duration so the caller can store a truthful length.
-    // Non-blocking + fail-soft: a failed probe → null duration, never a throw.
-    let durationMs = null;
-    const probe = await runFfprobe(
-      ["-v", "quiet", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", outputFile],
-    );
-    const durSec = parseFloat(probe);
-    if (Number.isFinite(durSec) && durSec > 0) durationMs = Math.round(durSec * 1000);
+    const outputVideo = await probeMuxVideo(outputFile);
+    assertMuxVideoComplete(sourceVideo, outputVideo);
+    const durationMs = outputVideo.duration_ms;
 
     const dt = ((Date.now() - t0) / 1000).toFixed(1);
     const stat = fs.statSync(outputFile);
@@ -211,6 +206,10 @@ async function handleMuxVideo(req, res, API_KEY) {
       "Content-Type": "video/mp4",
       "Content-Length": stat.size,
       "X-Mux-Audio-Codec": audioCodec,
+      "X-Video-Duration-Contract": "1",
+      "X-Source-Video-Duration-Ms": String(sourceVideo.duration_ms),
+      "X-Source-Video-Frame-Count": String(sourceVideo.frame_count),
+      "X-Mux-Video-Frame-Count": String(outputVideo.frame_count),
     };
     if (durationMs != null) headers["X-Mux-Video-Duration-Ms"] = String(durationMs);
     res.writeHead(200, headers);
@@ -229,4 +228,20 @@ async function handleMuxVideo(req, res, API_KEY) {
   }
 }
 
-module.exports = { routeMuxVideo };
+// Fail closed on unknown video metadata; container/audio duration is not evidence.
+function parseMuxVideoProbe(probe) {
+  const stream = probe?.streams?.find(s => s.codec_type === 'video');
+  const duration = Number(stream?.duration) * 1000, frames = Number(stream?.nb_frames);
+  if (!Number.isFinite(duration) || duration <= 0 || duration > 14401000 || !Number.isSafeInteger(frames) || frames <= 0)
+    throw new Error('video_duration_unverified: video stream duration/frame count unavailable');
+  return { duration_ms: Math.round(duration), frame_count: frames };
+}
+async function probeMuxVideo(file) {
+  const raw = await runFfprobe(['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=codec_type,duration,nb_frames', '-of', 'json', file], { timeoutMs: 30000 });
+  return parseMuxVideoProbe(JSON.parse(raw || '{}'));
+}
+function assertMuxVideoComplete(source, output) {
+  if (source.frame_count !== output.frame_count || Math.abs(source.duration_ms - output.duration_ms) > 2)
+    throw new Error('video_duration_mismatch: mux did not preserve every source video frame');
+}
+module.exports = { routeMuxVideo, parseMuxVideoProbe, assertMuxVideoComplete };
