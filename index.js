@@ -132,7 +132,7 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-09-29-export-editor-parity-v2";
+const BUILD_TAG = "extractor-2026-09-30-full-video-duration-v1";
 
 // ── FONT CAPABILITY PROBE (enterprise-grade — SOC 2 CC7.2) ───────────────────
 // A hardsub burn resolves its font through fontconfig. When a font is missing,
@@ -1526,6 +1526,7 @@ const server = http.createServer(async (req, res) => {
       fonts: fontCaps,
       burn_in_ready: fontCaps.fontconfig && fontCaps.liberation && fontCaps.cjk,
       mix_lane: getMixLaneStatus(),
+      video_duration_contract: 1,
     }));
   }
 
