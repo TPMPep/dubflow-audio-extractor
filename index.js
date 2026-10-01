@@ -3,6 +3,7 @@
 const http = require("http");
 const { spawn } = require("child_process");
 const fs = require("fs");
+const studioWindow = require('./studioWindow');
 
 // ── Async, non-blocking ffmpeg runner (SOC 2 CC7.2 — never freeze the loop) ──
 // execSync blocks the single-threaded Node event loop for the ENTIRE ffmpeg run.
@@ -132,7 +133,7 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-09-30-full-video-duration-v1";
+const BUILD_TAG = "extractor-2026-10-01-studio-source-window-v1";
 
 // ── FONT CAPABILITY PROBE (enterprise-grade — SOC 2 CC7.2) ───────────────────
 // A hardsub burn resolves its font through fontconfig. When a font is missing,
@@ -1484,6 +1485,7 @@ route({ method: "POST", path: "/extract-clips", handler: (req, res, key) => hand
 route({ method: "POST", path: "/time-stretch", handler: handleTimeStretch });
 route({ method: "POST", path: "/process", handler: handleProcess });
 route({ method: "POST", path: "/trim", handler: handleTrim });
+route({ method: "POST", path: "/studio-window", handler: (req, res, key) => studioWindow(req, res, key, { runFfmpeg, runFfprobe }) });
 route({ method: "POST", path: "/punch-assemble", handler: handlePunchAssemble });
 route({ method: "POST", path: "/silence-detect", handler: handleSilenceDetect });
 route({ method: "POST", path: "/audio-qc", handler: handleAudioQC });
