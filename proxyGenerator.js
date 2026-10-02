@@ -176,7 +176,12 @@ async function handleProxyGenSync(req, res, API_KEY) {
     return res.end(JSON.stringify({ error: "Unauthorized" }));
   }
 
-  const required = ["project_id", "source_url", "bucket", "region", "proxy_video_key", "proxy_audio_key"];
+  // Audio-only sources (studio recordings, audio uploads) have no picture: only
+  // the FLAC proxy is produced, so proxy_video_key is not required.
+  const audioOnly = body.audio_only === true;
+  const required = audioOnly
+    ? ["project_id", "source_url", "bucket", "region", "proxy_audio_key"]
+    : ["project_id", "source_url", "bucket", "region", "proxy_video_key", "proxy_audio_key"];
   for (const k of required) {
     if (!body[k]) {
       res.writeHead(400);
@@ -284,6 +289,7 @@ async function handleProxyGenSync(req, res, API_KEY) {
       "-fflags", "+genpts",
       "-err_detect", "ignore_err",
       "-i", source_url,
+      ...(audioOnly ? [] : [
       // Video proxy: 720p H.264 ~2 Mbps, AAC 128k stereo.
       // format=yuv420p downconverts 10-bit 4:2:2 ProRes/DNx to the 8-bit 4:2:0
       // H.264 the editor proxy needs (no-op for already-yuv420p sources).
@@ -294,8 +300,12 @@ async function handleProxyGenSync(req, res, API_KEY) {
       "-c:a", "aac", "-b:a", "128k", "-ac", "2",
       "-movflags", "+faststart",
       "-f", "mp4", videoPath,
-      // Audio proxy: 16 kHz mono FLAC for AssemblyAI / Replicate
-      "-map", "0:a:0?", "-vn", "-ac", "1", "-ar", "16000",
+      ]),
+      // Audio proxy: 16 kHz mono FLAC for waveform + AssemblyAI / Replicate.
+      // No -ss/-t: the full source is decoded from sample 0 so the proxy keeps
+      // the source timeline's exact origin and length. Audio-only requires a
+      // real audio stream (no `?`), so a stream-less file fails loudly (422).
+      "-map", audioOnly ? "0:a:0" : "0:a:0?", "-vn", "-ac", "1", "-ar", "16000",
       "-c:a", "flac", "-f", "flac", audioPath,
     ];
 
@@ -346,7 +356,7 @@ async function handleProxyGenSync(req, res, API_KEY) {
     // buffering the file. Run sequentially: two large concurrent stream-uploads
     // still each hold only a small buffer, but sequential keeps peak network +
     // fd usage predictable on the shared box.
-    const videoRes = await putS3ObjectStreaming(storage, proxy_video_key, videoPath, { contentType: "video/mp4" });
+    const videoRes = audioOnly ? { bytes: 0 } : await putS3ObjectStreaming(storage, proxy_video_key, videoPath, { contentType: "video/mp4" });
     const audioRes = await putS3ObjectStreaming(storage, proxy_audio_key, audioPath, { contentType: "audio/flac" });
     const videoBytes = videoRes.bytes;
     const audioBytes = audioRes.bytes;
@@ -364,8 +374,9 @@ async function handleProxyGenSync(req, res, API_KEY) {
     // ─── Synchronous reply — worker is holding the connection. ───
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({
-      proxy_video_key,
+      proxy_video_key: audioOnly ? null : proxy_video_key,
       proxy_audio_key,
+      audio_only: audioOnly,
       bytes_video: videoBytes,
       bytes_audio: audioBytes,
       duration_ms: durationMs,
