@@ -134,7 +134,7 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-10-06-take-quality-v1";
+const BUILD_TAG = "extractor-2026-10-06-take-quality-v2";
 
 // ── FONT CAPABILITY PROBE (enterprise-grade — SOC 2 CC7.2) ───────────────────
 // A hardsub burn resolves its font through fontconfig. When a font is missing,
@@ -1570,4 +1570,11 @@ const server = http.createServer(async (req, res) => {
   res.end("Not found");
 });
 
-server.listen(3000, () => console.log(`Audio extractor running on port 3000 (build ${BUILD_TAG})`));
+// Bind only when this file is the process entry point. If index.js is ever
+// loaded a second time (e.g. a module file in the repo accidentally holds a
+// copy of index.js), a second listen() would crash the container with
+// EADDRINUSE. This makes that structurally impossible.
+if (require.main === module) {
+  server.on("error", (err) => { console.error(`[FATAL] HTTP server error: ${err.message}`); process.exit(1); });
+  server.listen(3000, () => console.log(`Audio extractor running on port 3000 (build ${BUILD_TAG})`));
+}
