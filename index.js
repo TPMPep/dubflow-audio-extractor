@@ -134,7 +134,7 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-10-06-take-quality-v4";
+const BUILD_TAG = "extractor-2026-10-06-take-quality-v5";
 
 // ── FONT CAPABILITY PROBE (enterprise-grade — SOC 2 CC7.2) ───────────────────
 // A hardsub burn resolves its font through fontconfig. When a font is missing,
@@ -925,7 +925,8 @@ async function handleTrim(req, res, API_KEY) {
   }
 
   const { audio_url, start_ms, end_ms, fade_in_ms = 30, fade_out_ms = 50, tail_pad_ms = 0, output_format = "mp3",
-    pitch_semitones = 0, gain_db = 0, repair_declip = false, repair_fry_level = 0 } = body;
+    pitch_semitones = 0, gain_db = 0, repair_declip = false, repair_fry_level = 0, repair_highpass = false } = body;
+  const highpass = repair_highpass === true;
   const format = output_format === "wav" ? "wav" : "mp3";
   const declip = repair_declip === true;
   const fryLevel = Math.max(0, Math.min(2, Math.round(Number(repair_fry_level) || 0)));
@@ -973,6 +974,10 @@ async function handleTrim(req, res, API_KEY) {
     // peaks; fry reduction is a high-pass plus a low-mid cut that softens
     // irregular creak without thinning the voice.
     if (declip) filters.push('adeclip=w=55:o=75:a=8:t=10:n=1000');
+    // Dialogue high-pass: two cascaded 2-pole stages (24 dB/oct) at 60 Hz.
+    // Removes hum, rumble and DC under the voice with no tonal EQ, so it does
+    // not alter the voice's fundamental the way fry reduction does.
+    if (highpass) filters.push('highpass=f=60:p=2', 'highpass=f=60:p=2');
     if (fryLevel === 1) filters.push('highpass=f=70:p=2', 'equalizer=f=110:t=q:w=1.2:g=-3');
     if (fryLevel === 2) filters.push('highpass=f=90:p=2', 'equalizer=f=120:t=q:w=1:g=-6');
     // 1) PITCH — formant-preserving (librubberband). `formant=preserved` keeps the
