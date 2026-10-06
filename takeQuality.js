@@ -4,7 +4,7 @@
 // Every figure is computed from the decoded samples of the exact file supplied
 // (source window or rendered preview), never estimated in a browser:
 //   loudness (BS.1770 integrated LUFS) + true peak (dBTP, 4x oversampled) via ebur128;
-//   clipping runs, DC offset, rumble (<80 Hz), harshness (2-5 kHz), clicks,
+//   clipping runs, DC offset, rumble (<60 Hz), harshness (2-5 kHz), clicks,
 //   head/tail dead air and possible vocal fry (pitch-tracked) from PCM in-process.
 const { spawn } = require("child_process");
 const fs = require("fs");
@@ -98,13 +98,25 @@ function measurePcm(x) {
     if (a > peak) peak = a;
     if (a >= 0.999) { run += 1; if (run === 3) clipRuns += 1; } else run = 0;
   }
-  const rumblePct = (energy(cascade(x, "lp", 80, SR)) / total) * 100;
+  // Rumble = sub-voice energy only (< 60 Hz: hum, HVAC, handling). An 80 Hz
+  // corner leaked the voice's own fundamental (85-120 Hz) into the figure, so
+  // a clean male read scored as "rumble" that no high-pass could remove.
+  const rumblePct = (energy(cascade(x, "lp", 60, SR)) / total) * 100;
   const harshPct = (energy(biquad(biquad(x, "bp", 3200, 0.9, SR), "bp", 3200, 0.9, SR)) / total) * 100;
   // Clicks: 5 ms frames of a 4 kHz high-pass, peak > 18 dB over the line's own median.
   const hf = cascade(x, "hp", 4000, SR), cf = SR / 200, peaks = [];
   for (let i = 0; i + cf <= hf.length; i += cf) { let p = 0; for (let j = i; j < i + cf; j += 1) p = Math.max(p, Math.abs(hf[j])); peaks.push(db(p)); }
   const finite = peaks.filter(Number.isFinite), med = median(finite);
-  const clicks = finite.filter((p) => p > med + 18 && p > -45).length;
+  // A click is IMPULSIVE: touching hot frames merge into one event, and only
+  // events of ≤ 2 frames (≤ 10 ms) count. Sibilants and plosives ("s", "t",
+  // "k") are sustained 40-120 ms high-frequency bursts and are speech, not noise.
+  let clicks = 0, hotRun = 0;
+  for (let i = 0; i <= peaks.length; i += 1) {
+    const hot = i < peaks.length && Number.isFinite(peaks[i]) && peaks[i] > med + 18 && peaks[i] > -45;
+    if (hot) { hotRun += 1; continue; }
+    if (hotRun > 0 && hotRun <= 2) clicks += 1;
+    hotRun = 0;
+  }
   const act = activity(x);
   const first = act.indexOf(true), last = act.lastIndexOf(true);
   const durationMs = Math.round((x.length / SR) * 1000);
@@ -116,6 +128,7 @@ function measurePcm(x) {
     rumble_pct: +rumblePct.toFixed(2),
     harshness_pct: +harshPct.toFixed(1),
     click_count: clicks,
+    clicks_per_10s: +(clicks / Math.max(1, durationMs / 10000)).toFixed(1),
     leading_silence_ms: first < 0 ? durationMs : first * 10,
     trailing_silence_ms: last < 0 ? durationMs : Math.max(0, durationMs - (last + 1) * 10),
     ...fryAnalysis(x),
