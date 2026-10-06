@@ -133,7 +133,7 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-10-01-studio-source-window-v1";
+const BUILD_TAG = "extractor-2026-10-06-take-repair-v1";
 
 // ── FONT CAPABILITY PROBE (enterprise-grade — SOC 2 CC7.2) ───────────────────
 // A hardsub burn resolves its font through fontconfig. When a font is missing,
@@ -198,6 +198,7 @@ async function getFilterCaps() {
   _filterCaps = {
     rubberband: /\brubberband\b/.test(listing),
     alimiter: /\balimiter\b/.test(listing),
+    adeclip: /\badeclip\b/.test(listing),
   };
   return _filterCaps;
 }
@@ -923,8 +924,10 @@ async function handleTrim(req, res, API_KEY) {
   }
 
   const { audio_url, start_ms, end_ms, fade_in_ms = 30, fade_out_ms = 50, tail_pad_ms = 0, output_format = "mp3",
-    pitch_semitones = 0, gain_db = 0 } = body;
+    pitch_semitones = 0, gain_db = 0, repair_declip = false, repair_fry_level = 0 } = body;
   const format = output_format === "wav" ? "wav" : "mp3";
+  const declip = repair_declip === true;
+  const fryLevel = Math.max(0, Math.min(2, Math.round(Number(repair_fry_level) || 0)));
   const startMs = Math.round(Number(start_ms));
   const endMs = Math.round(Number(end_ms));
   const fadeInMs = Math.max(0, Math.min(250, Math.round(Number(fade_in_ms) || 0)));
@@ -945,6 +948,10 @@ async function handleTrim(req, res, API_KEY) {
     res.writeHead(400, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ error: "This ffmpeg build has no librubberband, so formant-preserving pitch is unavailable. Pitch is refused rather than substituted with a formant-shifting fallback.", code: "pitch_unsupported" }));
   }
+  if (declip && !caps.adeclip) {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ error: "This ffmpeg build has no adeclip, so clipping repair is unavailable.", code: "declip_unsupported" }));
+  }
 
   const tmpDir = fs.mkdtempSync('/tmp/trim_');
   const inputFile = `${tmpDir}/input`;
@@ -960,6 +967,13 @@ async function handleTrim(req, res, API_KEY) {
     const contentMs = endMs - startMs;
     const finalMs = contentMs + tailPadMs;
     const filters = [];
+    // 0) REPAIR — runs on the untouched source before any other stage, so
+    // reconstruction sees the original waveform. adeclip rebuilds flattened
+    // peaks; fry reduction is a high-pass plus a low-mid cut that softens
+    // irregular creak without thinning the voice.
+    if (declip) filters.push('adeclip=w=55:o=75:a=8:t=10:n=1000');
+    if (fryLevel === 1) filters.push('highpass=f=70:p=2', 'equalizer=f=110:t=q:w=1.2:g=-3');
+    if (fryLevel === 2) filters.push('highpass=f=90:p=2', 'equalizer=f=120:t=q:w=1:g=-6');
     // 1) PITCH — formant-preserving (librubberband). `formant=preserved` keeps the
     // vocal tract fixed while the fundamental moves, so the speaker's identity is
     // retained instead of chipmunked. Tempo is untouched, so the pass is
