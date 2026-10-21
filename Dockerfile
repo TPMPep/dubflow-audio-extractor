@@ -1,9 +1,12 @@
-FROM node:20-slim
+# Node 24 LTS, pinned to an exact patched release (Oct 21 2026 Node security
+# release: Brotli RCE, TLS hostname bypasses, Undici). Never float to a bare
+# major tag — the deployed runtime must be provable from this file.
+FROM node:24.22.1-slim
 
 # ffmpeg for every transcode, mix, mux and hardsub.
 #
 # FONTS ARE NOT OPTIONAL FOR A HARDSUB CONTAINER. libass resolves the ASS style's
-# font through fontconfig, and node:20-slim ships NO fonts at all — so a burn in a
+# font through fontconfig, and node:24-slim ships NO fonts at all — so a burn in a
 # non-Latin language rendered as tofu boxes (□□□) while still producing a
 # perfectly valid MP4 and reporting success. That is the worst failure shape
 # available: the deliverable looks fine to the pipeline and is unusable to the
