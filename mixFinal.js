@@ -270,6 +270,11 @@ async function handleMixFinal(req, res, API_KEY) {
   const durationMs = Number(body.duration_ms);
   const outputFormat = (body.output_format || "wav").toLowerCase();
   const sampleRate = Number(body.sample_rate || 48000);
+  // Output channel count. The mix is always built in stereo; mono deliverables
+  // are an equal-power downmix at encode time. Default stays stereo.
+  const outChannels = body.channels == null ? 2 : Number(body.channels);
+  if (![1, 2].includes(outChannels)) { res.writeHead(400); return res.end(JSON.stringify({ error: "channels must be 1 or 2" })); }
+  const ac = String(outChannels);
   // Symmetric de-click fades on every clip. The editor preview uses the same
   // 15ms envelope, so a hard head/tail cannot produce an export-only tick when
   // two authored windows touch. This changes no timecode and removes no audio.
@@ -416,14 +421,14 @@ async function handleMixFinal(req, res, API_KEY) {
     args2.push("-filter_complex_script", filterFile2, "-map", "[out]");
 
     if (outputFormat === "wav") {
-      args2.push("-c:a", "pcm_s24le", "-ar", String(sampleRate), "-ac", "2");
+      args2.push("-c:a", "pcm_s24le", "-ar", String(sampleRate), "-ac", ac);
     } else if (outputFormat === "flac") {
       // Lossless compressed deliverable — 24-bit FLAC (s32 input → 24 bps).
-      args2.push("-c:a", "flac", "-sample_fmt", "s32", "-ar", String(sampleRate), "-ac", "2");
+      args2.push("-c:a", "flac", "-sample_fmt", "s32", "-ar", String(sampleRate), "-ac", ac);
     } else if (outputFormat === "mp3") {
-      args2.push("-c:a", "libmp3lame", "-b:a", "320k", "-ar", String(sampleRate), "-ac", "2");
+      args2.push("-c:a", "libmp3lame", "-b:a", "320k", "-ar", String(sampleRate), "-ac", ac);
     } else if (outputFormat === "aac") {
-      args2.push("-c:a", "aac", "-b:a", "256k", "-ar", String(sampleRate), "-ac", "2");
+      args2.push("-c:a", "aac", "-b:a", "256k", "-ar", String(sampleRate), "-ac", ac);
     }
     args2.push(outputFile);
 
