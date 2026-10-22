@@ -154,9 +154,11 @@ async function handleExtractAndUploadLalal(req, res, API_KEY) {
     //    codec chosen by output_format (mp3→lame, flac→native FLAC). extra_args
     //    carries ONLY non-codec output flags. NO -ss/-t (LALAL handles whole
     //    file). Decode-side hardening for pro-codec masters (ProRes/DNx).
-    const codecArgs = output_format === "flac"
-      ? ["-c:a", "flac"]
-      : ["-c:a", "libmp3lame", "-q:a", "2"];
+    const codecArgs = output_format === "wav"
+      ? ["-c:a", "pcm_s24le", "-ar", "48000"]
+      : output_format === "flac"
+        ? ["-c:a", "flac"]
+        : ["-c:a", "libmp3lame", "-q:a", "2"];
     const extraArgv = extra_args.trim() ? extra_args.trim().split(/\s+/) : [];
     const ffmpegArgs = [
       "-y",
