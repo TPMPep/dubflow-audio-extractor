@@ -134,7 +134,7 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-10-06-take-quality-v5";
+const BUILD_TAG = "extractor-2026-10-28-take-cuts-v1";
 
 // ── FONT CAPABILITY PROBE (enterprise-grade — SOC 2 CC7.2) ───────────────────
 // A hardsub burn resolves its font through fontconfig. When a font is missing,
@@ -915,6 +915,8 @@ async function handleProcess(req, res, API_KEY) {
 // Returns the trimmed audio file binary directly (Content-Type: audio/<format>).
 // Used by pickup-line recording flow to remove dead air based on AssemblyAI word timings
 // OR based on user-dragged trim handles in the preview sandbox.
+// Fade applied on each side of an interior cut join (anti-click).
+const CUT_JOIN_FADE_MS = 8;
 async function handleTrim(req, res, API_KEY) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
@@ -925,7 +927,7 @@ async function handleTrim(req, res, API_KEY) {
   }
 
   const { audio_url, start_ms, end_ms, fade_in_ms = 30, fade_out_ms = 50, tail_pad_ms = 0, output_format = "mp3",
-    pitch_semitones = 0, gain_db = 0, repair_declip = false, repair_fry_level = 0, repair_highpass = false } = body;
+    pitch_semitones = 0, gain_db = 0, repair_declip = false, repair_fry_level = 0, repair_highpass = false, cuts = [] } = body;
   const highpass = repair_highpass === true;
   const format = output_format === "wav" ? "wav" : "mp3";
   const declip = repair_declip === true;
@@ -966,7 +968,21 @@ async function handleTrim(req, res, API_KEY) {
     const sourceDurationMs = Math.round(sourceDuration.seconds * 1000);
     if (startMs < 0 || endMs > sourceDurationMs + 20) throw new Error(`Trim window ${startMs}-${endMs}ms is outside measured source duration ${sourceDurationMs}ms`);
 
-    const contentMs = endMs - startMs;
+    // INTERIOR CUTS — operator-marked spans (source ms) removed from inside the
+    // kept window. Each join gets a short symmetric fade on both sides so the
+    // splice cannot click; the join adds no length, so output = kept - cuts.
+    const cutList = Array.isArray(cuts) ? cuts.map(c => ({ s: Math.round(Number(c.start_ms)), e: Math.round(Number(c.end_ms)) })) : [];
+    let prevEdge = startMs;
+    for (const c of cutList) {
+      if (!Number.isFinite(c.s) || !Number.isFinite(c.e) || c.s < prevEdge + 20 || c.e - c.s < 20 || c.e > endMs - 20) throw new Error("Cuts must be ordered, non-overlapping and inside the trim window");
+      prevEdge = c.e;
+    }
+    if (cutList.length > 20) throw new Error("At most 20 cuts per line");
+    const pieces = [];
+    let cursor = startMs;
+    for (const c of cutList) { pieces.push([cursor - startMs, c.s - startMs]); cursor = c.e; }
+    pieces.push([cursor - startMs, endMs - startMs]);
+    const contentMs = pieces.reduce((sum, [a, b]) => sum + (b - a), 0);
     const finalMs = contentMs + tailPadMs;
     const filters = [];
     // 0) REPAIR — runs on the untouched source before any other stage, so
@@ -1008,8 +1024,20 @@ async function handleTrim(req, res, API_KEY) {
     }
     filters.push('asetpts=N/SR/TB');
     const codec = format === "wav" ? ["-c:a", "pcm_s24le", "-ar", "48000"] : ["-c:a", "libmp3lame", "-q:a", "2", "-ar", "44100"];
-    await runFfmpeg(["-y", "-ss", (startMs / 1000).toFixed(6), "-t", (contentMs / 1000).toFixed(6), "-i", inputFile,
-      "-af", filters.join(','), "-vn", ...codec, "-ac", "1", outputFile], { timeoutMs: 30000, label: "Take finishing" });
+    let filterArgs = ["-af", filters.join(',')];
+    if (pieces.length > 1) {
+      const JOIN_FADE_S = (CUT_JOIN_FADE_MS / 1000).toFixed(4);
+      const labels = pieces.map((_, i) => `[p${i}]`);
+      const parts = pieces.map(([a, b], i) => {
+        const d = (b - a) / 1000;
+        const fades = [i > 0 ? `afade=t=in:st=0:d=${JOIN_FADE_S}` : null, i < pieces.length - 1 ? `afade=t=out:st=${Math.max(0, d - CUT_JOIN_FADE_MS / 1000).toFixed(4)}:d=${JOIN_FADE_S}` : null].filter(Boolean);
+        return `[s${i}]atrim=start=${(a / 1000).toFixed(6)}:end=${(b / 1000).toFixed(6)},asetpts=PTS-STARTPTS${fades.length ? ',' + fades.join(',') : ''}${labels[i]}`;
+      });
+      const graph = `[0:a]asplit=${pieces.length}${pieces.map((_, i) => `[s${i}]`).join('')};${parts.join(';')};${labels.join('')}concat=n=${pieces.length}:v=0:a=1[k];[k]${filters.join(',')}[out]`;
+      filterArgs = ["-filter_complex", graph, "-map", "[out]"];
+    }
+    await runFfmpeg(["-y", "-ss", (startMs / 1000).toFixed(6), "-t", ((endMs - startMs) / 1000).toFixed(6), "-i", inputFile,
+      ...filterArgs, "-vn", ...codec, "-ac", "1", outputFile], { timeoutMs: 30000, label: "Take finishing" });
 
     const outputBuffer = fs.readFileSync(outputFile);
     const outputProbe = await runFfprobe(["-v", "quiet", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", outputFile]);
@@ -1029,7 +1057,7 @@ async function handleTrim(req, res, API_KEY) {
     res.writeHead(200, { "Content-Type": format === "wav" ? "audio/wav" : "audio/mpeg",
       "X-Source-Duration-Ms": String(sourceDurationMs), "X-Source-Duration-Method": sourceDuration.method,
       "X-Output-Duration-Ms": String(outputDurationMs),
-      "X-Trim-Start-Ms": String(startMs), "X-Trim-End-Ms": String(endMs), "X-Tail-Pad-Ms": String(tailPadMs),
+      "X-Trim-Start-Ms": String(startMs), "X-Trim-End-Ms": String(endMs), "X-Tail-Pad-Ms": String(tailPadMs), "X-Cut-Count": String(cutList.length), "X-Cut-Removed-Ms": String(endMs - startMs - contentMs),
       "X-Pitch-Semitones": pitchSemitones.toFixed(2), "X-Applied-Gain-Db": gainDb.toFixed(2),
       "X-Peak-Ceiling-Dbfs": PEAK_CEILING_DBFS.toFixed(2),
       ...(Number.isFinite(outputPeakDb) ? { "X-Output-Peak-Dbfs": outputPeakDb.toFixed(2) } : {}),
