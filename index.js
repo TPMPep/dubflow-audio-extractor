@@ -47,7 +47,7 @@ const s3signer = require("./s3-signer");
 const { presignS3Url, putS3Object, storageFromEnv, storageFromExplicit } = s3signer;
 const { routeMixFinal, getMixLaneStatus } = require("./mixFinal");
 const { routeMuxVideo } = require("./muxVideo");
-const { routeProxyGen, routeMediaProbe } = require("./proxyGenerator");
+const { routeProxyGen, routeProxyGenStart, routeProxyGenStatus, routeMediaProbe } = require("./proxyGenerator");
 const { routeHlsIngest } = require("./hlsIngest");
 const { routeHashFile } = require("./hashFile");
 const { routeBurnSubtitles } = require("./burnSubtitles");
@@ -134,7 +134,7 @@ const storage = storageFromEnv({ region: AWS_REGION, bucket: BUCKET });
 // /health-build-tag verification pattern the BullMQ worker uses) before relying
 // on a code path. This build converts the fragile listener-swapping route
 // registration into a single explicit route table (see the router below).
-const BUILD_TAG = "extractor-2026-10-28-take-cuts-v1";
+const BUILD_TAG = "extractor-2026-10-30-proxy-async-v1";
 
 // ── FONT CAPABILITY PROBE (enterprise-grade — SOC 2 CC7.2) ───────────────────
 // A hardsub burn resolves its font through fontconfig. When a font is missing,
@@ -1543,6 +1543,8 @@ route({ method: "POST", path: "/concat", handler: handleConcat });
 route(routeMixFinal);
 route(routeMuxVideo);
 route(routeProxyGen);
+route(routeProxyGenStart);
+route(routeProxyGenStatus);
 route(routeMediaProbe);
 route(routeHlsIngest);
 route(routeHashFile);
