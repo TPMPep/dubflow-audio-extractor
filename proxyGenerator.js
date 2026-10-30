@@ -98,14 +98,17 @@ async function probeSourceMetadata(sourceUrl) {
   try {
     const probe = await runProcess("ffprobe", [
       "-v", "error",
-      "-select_streams", "v:0",
-      "-show_entries", "format=duration:stream=r_frame_rate,codec_name,width,height",
+      "-show_entries", "format=duration:format_tags=timecode:stream=codec_type,r_frame_rate,codec_name,width,height:stream_tags=timecode",
       "-of", "json",
       sourceUrl,
     ], { timeoutMs: 60_000 });
-    if (probe.status !== 0) return { frame_rate: null, duration_ms: null };
+    if (probe.status !== 0) return { frame_rate: null, duration_ms: null, timecode: null };
     const parsed = JSON.parse(String(probe.stdout || "{}"));
-    const stream = parsed?.streams?.[0] || {};
+    const streams = Array.isArray(parsed?.streams) ? parsed.streams : [];
+    const stream = streams.find((s) => s.codec_type === "video") || {};
+    // Start timecode: container tag, else the video or tmcd/data stream tag.
+    const tcCandidates = [parsed?.format?.tags?.timecode, stream.tags?.timecode, ...streams.map((s) => s.tags?.timecode)];
+    const timecode = tcCandidates.map((t) => String(t || "").trim()).find((t) => /^\d+:\d{1,2}:\d{1,2}[:;.,]\d{1,2}$/.test(t)) || null;
     const rawRate = String(stream.r_frame_rate || "");
     const match = rawRate.match(/^(\d+)\/(\d+)$/);
     const fps = match && Number(match[2]) > 0 ? Number(match[1]) / Number(match[2]) : Number(rawRate);
@@ -116,9 +119,10 @@ async function probeSourceMetadata(sourceUrl) {
       codec: stream.codec_name || null,
       width: Number(stream.width) || null,
       height: Number(stream.height) || null,
+      timecode,
     };
   } catch {
-    return { frame_rate: null, duration_ms: null };
+    return { frame_rate: null, duration_ms: null, timecode: null };
   }
 }
 
@@ -384,6 +388,7 @@ async function handleProxyGenSync(req, res, API_KEY) {
       // finalizer writes it to Project.frame_rate with frame_rate_source='ffprobe'.
       source_frame_rate: sourceMetadata.frame_rate,
       source_duration_ms: sourceMetadata.duration_ms,
+      source_timecode: sourceMetadata.timecode,
       project_id,
     }));
   } catch (err) {
@@ -407,8 +412,72 @@ async function handleProxyGenSync(req, res, API_KEY) {
   }
 }
 
+// ── ASYNC START + STATUS (edge-safe long transcodes) ──────────────────────
+// Railway's edge ends any request held open past its maximum duration, so a
+// long-form source (large file, long transcode) lost its connection with an
+// "upstream error" while ffmpeg was still working. The worker now starts the
+// job (202 + job_id, instant) and asks for its status every few seconds; every
+// request is short. The job runs the SAME handler as the sync route, so
+// validation, the heavy-lane gate (503) and every status code are identical.
+// Jobs live in memory: a restarted service answers 404 for an unknown job, and
+// the worker retries from the start.
+const { Readable } = require("stream");
+const crypto = require("crypto");
+const PROXY_JOBS = new Map();
+const JOB_RETENTION_MS = 60 * 60 * 1000;
+
+function captureResponse(job) {
+  return {
+    writeHead(status) { job.status = status; },
+    setHeader() {},
+    end(text) { job.state = "done"; job.body = String(text || ""); job.finished_at = Date.now(); },
+  };
+}
+
+async function readJson(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
+
+function authorized(req, body, API_KEY) {
+  const token = (req.headers["authorization"] || "").replace("Bearer ", "");
+  return token === API_KEY || body?.api_key === API_KEY;
+}
+
+async function handleProxyGenStart(req, res, API_KEY) {
+  const raw = await readJson(req);
+  let body;
+  try { body = JSON.parse(raw.toString()); } catch { res.writeHead(400); return res.end(JSON.stringify({ error: "bad JSON" })); }
+  if (!authorized(req, body, API_KEY)) { res.writeHead(401); return res.end(JSON.stringify({ error: "Unauthorized" })); }
+  for (const [id, job] of PROXY_JOBS) if (job.finished_at && Date.now() - job.finished_at > JOB_RETENTION_MS) PROXY_JOBS.delete(id);
+  const jobId = crypto.randomUUID();
+  const job = { state: "running", status: 0, body: "", started_at: Date.now(), project_id: body.project_id };
+  PROXY_JOBS.set(jobId, job);
+  const syntheticReq = Readable.from([raw]);
+  syntheticReq.headers = req.headers;
+  handleProxyGenSync(syntheticReq, captureResponse(job), API_KEY).catch((err) => {
+    job.state = "done"; job.status = 500; job.finished_at = Date.now();
+    job.body = JSON.stringify({ error: "proxy_gen_failed", message: String(err?.message || err).slice(0, 1000) });
+  });
+  res.writeHead(202, { "Content-Type": "application/json" });
+  return res.end(JSON.stringify({ job_id: jobId }));
+}
+
+async function handleProxyGenStatus(req, res, API_KEY) {
+  let body;
+  try { body = JSON.parse((await readJson(req)).toString()); } catch { res.writeHead(400); return res.end(JSON.stringify({ error: "bad JSON" })); }
+  if (!authorized(req, body, API_KEY)) { res.writeHead(401); return res.end(JSON.stringify({ error: "Unauthorized" })); }
+  const job = PROXY_JOBS.get(String(body.job_id || ""));
+  res.writeHead(job ? 200 : 404, { "Content-Type": "application/json" });
+  if (!job) return res.end(JSON.stringify({ error: "job_not_found" }));
+  return res.end(JSON.stringify({ state: job.state, status: job.status, body: job.body, elapsed_ms: Date.now() - job.started_at }));
+}
+
 // Route descriptors — registered once in index.js's single route table.
 const routeProxyGen = { method: "POST", path: "/generate-proxy-sync", handler: handleProxyGenSync };
+const routeProxyGenStart = { method: "POST", path: "/generate-proxy-start", handler: handleProxyGenStart };
+const routeProxyGenStatus = { method: "POST", path: "/generate-proxy-status", handler: handleProxyGenStatus };
 const routeMediaProbe = { method: "POST", path: "/probe-media", handler: handleMediaProbe };
 
-module.exports = { routeProxyGen, routeMediaProbe };
+module.exports = { routeProxyGen, routeProxyGenStart, routeProxyGenStatus, routeMediaProbe };
