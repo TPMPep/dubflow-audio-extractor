@@ -282,14 +282,15 @@ async function handleMixFinal(req, res, API_KEY) {
   const fadeInMs = Math.max(0, Math.min(50, Number(body.fade_in_ms ?? _legacyFade ?? 15)));
   const fadeOutMs = Math.max(0, Math.min(50, Number(body.fade_out_ms ?? _legacyFade ?? 15)));
 
-  // EBU R128 loudness normalization target (LUFS). -16 streaming / -23 broadcast
-  // / null = no normalization. True-peak ceiling always -1 dBTP, LRA 11 LU.
+  // EBU R128 loudness normalization target (LUFS). -16 streaming / -18 client
+  // dialogue specs / -23 broadcast / null = no normalization. True-peak ceiling
+  // always -1 dBTP, LRA 11 LU.
   const loudnessTargetLufs = body.loudness_target_lufs != null
     ? Number(body.loudness_target_lufs)
     : null;
-  if (loudnessTargetLufs != null && ![-16, -23].includes(loudnessTargetLufs)) {
+  if (loudnessTargetLufs != null && ![-16, -18, -23].includes(loudnessTargetLufs)) {
     res.writeHead(400);
-    return res.end(JSON.stringify({ error: "loudness_target_lufs must be -16 or -23" }));
+    return res.end(JSON.stringify({ error: "loudness_target_lufs must be -16, -18 or -23" }));
   }
 
   if (clips.length === 0) { res.writeHead(400); return res.end(JSON.stringify({ error: "clips array required and non-empty" })); }
